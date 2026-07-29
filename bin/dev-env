@@ -1,0 +1,765 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+
+# Run project branches on this box, each reachable over HTTPS.
+#
+# An environment is one slot in a per-project pool, and bundles a git worktree, a
+# postgres database, a loopback port and a systemd user unit. Caddy terminates
+# TLS in front and fetches a Let's Encrypt certificate per hostname.
+#
+# Projects describe themselves in a .dev-env.json at their repository root; run
+# `dev-env setup` once per machine and `dev-env init` once per project.
+
+require "fileutils"
+require "json"
+require "net/http"
+require "optparse"
+require "securerandom"
+require "socket"
+require "time"
+
+HOME_DIR    = ENV.fetch("DEV_ENV_HOME", File.expand_path("~/dev-envs"))
+CONFIG_PATH = File.join(HOME_DIR, "config.json")
+STATE_DIR   = File.join(HOME_DIR, "envs")
+DUMP_DIR    = File.join(HOME_DIR, "dumps")
+RUN_DIR     = File.join(HOME_DIR, "run")
+SECRET_DIR  = File.join(HOME_DIR, "secrets")
+SITES_DIR   = ENV.fetch("DEV_ENV_SITES_DIR", "/etc/caddy/sites")
+CADDYFILE   = ENV.fetch("DEV_ENV_CADDYFILE", "/etc/caddy/Caddyfile")
+UNIT_PATH   = File.expand_path("~/.config/systemd/user/dev-env@.service")
+
+# A key becomes a DNS label, a database name and a systemd instance name, so keep
+# it to the intersection of what all three accept.
+MAX_LABEL = 40
+
+def abort!(message)
+  warn "\e[31m✗\e[0m #{message}"
+  exit 1
+end
+
+def step(message) = puts("\e[36m→\e[0m #{message}")
+def ok(message)   = puts("\e[32m✓\e[0m #{message}")
+def note(message) = warn("\e[33m!\e[0m #{message}")
+
+def run(*cmd, chdir: nil, env: {}, check: true, quiet: false)
+  puts "  \e[90m$ #{cmd.join(' ')}\e[0m" unless quiet
+  options = chdir ? { chdir: chdir } : {}
+  success = system(env, *cmd, **options)
+  abort!("command failed: #{cmd.join(' ')}") if check && !success
+  success
+end
+
+# Project-supplied commands are arbitrary shell, so they run through sh rather
+# than being split into an argv here.
+def shell(command, chdir:, env: {}, check: true)
+  puts "  \e[90m$ #{command}\e[0m"
+  success = system(env, command, chdir: chdir)
+  abort!("command failed: #{command}") if check && !success
+  success
+end
+
+def capture(*cmd)
+  IO.popen(cmd, err: File::NULL, &:read).to_s.strip
+end
+
+def slugify(value)
+  slug = value.downcase.gsub(/[^a-z0-9]+/, "-").gsub(/\A-+|-+\z/, "")
+  slug = slug[0, MAX_LABEL].sub(/-+\z/, "")
+  abort!("could not derive a usable name from #{value.inspect}") if slug.empty?
+  slug
+end
+
+def interpolate(value, vars)
+  case value
+  when String then value.gsub(/\$\{(\w+)\}/) { vars.fetch(Regexp.last_match(1), "") }
+  when Array  then value.map { |item| interpolate(item, vars) }
+  when Hash   then value.transform_values { |item| interpolate(item, vars) }
+  else value
+  end
+end
+
+# ---------------------------------------------------------------- configuration
+
+def detect_public_ip
+  ip = capture("sh", "-c", "ip -4 route get 1.1.1.1 2>/dev/null | grep -oP 'src \\K[0-9.]+'")
+  ip.empty? ? nil : ip
+end
+
+def config
+  @config ||= begin
+    abort!("no #{CONFIG_PATH} — run: dev-env setup") unless File.exist?(CONFIG_PATH)
+    JSON.parse(File.read(CONFIG_PATH))
+  end
+end
+
+DEFAULT_PROJECT = {
+  "commands" => {
+    "install" => nil,
+    "schema"  => nil,
+    "migrate" => nil,
+    "server"  => nil,
+  },
+  "env" => {},
+  "after_restore" => [],
+  "worktree_files" => {},
+  "pool_size" => nil,
+  "seed" => nil,
+}.freeze
+
+# Everything about a project is derived from the repository it is run in, so the
+# same tool serves any number of them.
+def project
+  @project ||= begin
+    root = capture("git", "rev-parse", "--show-toplevel")
+    abort!("not inside a git repository") if root.empty?
+
+    path = File.join(root, ".dev-env.json")
+    abort!("no .dev-env.json in #{root} — run: dev-env init") unless File.exist?(path)
+
+    settings = DEFAULT_PROJECT.merge(JSON.parse(File.read(path)))
+    settings["commands"] = DEFAULT_PROJECT["commands"].merge(settings["commands"] || {})
+    settings["root"] = root
+    settings["name"] = slugify(settings["name"] || File.basename(root))
+    # Worktrees sit in a container folder beside the checkout, never loose in the
+    # parent directory.
+    settings["worktree_root"] =
+      settings["worktree_root"] || File.join(File.dirname(root), "#{File.basename(root)}-worktrees")
+    settings["pool_size"] ||= config.fetch("pool_size", 3)
+    settings["seed"] ||= "#{settings['name']}-seed.pdump"
+    settings
+  end
+end
+
+def pool = (1..Integer(project["pool_size"])).map { |n| "dev#{n}" }
+def key_for(slot) = "#{project['name']}-#{slot}"
+def domain_for(slot) = "#{slot}.#{project['name']}.#{config['base_domain']}"
+
+def state_path(key)  = File.join(STATE_DIR, "#{key}.json")
+def env_path(key)    = File.join(STATE_DIR, "#{key}.env")
+def site_path(key)   = File.join(SITES_DIR, "#{key}.caddy")
+def run_path(key)    = File.join(RUN_DIR, "#{key}.sh")
+def secret_path(key) = File.join(SECRET_DIR, "#{key}.password")
+def database_for(key) = "dev_env_#{key.tr('-', '_')}"
+def unit(key) = "dev-env@#{key}.service"
+def default_dump = File.join(DUMP_DIR, project["seed"])
+
+def load_state(key)
+  abort!("no environment #{key.inspect} (try: dev-env list)") unless File.exist?(state_path(key))
+  JSON.parse(File.read(state_path(key)))
+end
+
+def all_keys = Dir.glob(File.join(STATE_DIR, "*.json")).map { |f| File.basename(f, ".json") }.sort
+
+# The password is kept per slot rather than per environment so a browser that
+# saved it keeps working after the slot is torn down and reused.
+def password_for(key)
+  FileUtils.mkdir_p(SECRET_DIR)
+  path = secret_path(key)
+  unless File.exist?(path)
+    File.write(path, SecureRandom.alphanumeric(16))
+    File.chmod(0o600, path)
+  end
+  File.read(path).strip
+end
+
+def port_taken?(port)
+  TCPServer.new("127.0.0.1", port).close
+  false
+rescue Errno::EADDRINUSE, Errno::EACCES
+  true
+end
+
+def free_port
+  low, high = config.fetch("port_range", [4000, 4999])
+  reserved = all_keys.filter_map { |k| JSON.parse(File.read(state_path(k)))["port"] rescue nil }
+  (low..high).to_a.shuffle.each do |port|
+    next if reserved.include?(port)
+    return port unless port_taken?(port)
+  end
+  abort!("no free port available in #{low}..#{high}")
+end
+
+def database_exists?(name)
+  capture("psql", "-tAc", "SELECT 1 FROM pg_database WHERE datname = '#{name}'") == "1"
+end
+
+def caddy_reload = run("caddy", "reload", "--config", CADDYFILE, quiet: true)
+def systemctl(*args, check: true) = run("systemctl", "--user", *args, check: check, quiet: true)
+
+# ---------------------------------------------------------------- setup
+
+def cmd_setup(_argv)
+  ip = detect_public_ip || abort!("could not detect a public IPv4 address")
+  FileUtils.mkdir_p([HOME_DIR, STATE_DIR, DUMP_DIR, RUN_DIR, SECRET_DIR])
+  FileUtils.chmod(0o700, SECRET_DIR)
+
+  unless File.exist?(CONFIG_PATH)
+    File.write(CONFIG_PATH, JSON.pretty_generate({
+      "base_domain" => "example.com",
+      "bind_ip" => ip,
+      "port_range" => [4000, 4999],
+      "pool_size" => 3,
+      "acme_email" => "",
+    }) + "\n")
+    ok "Wrote #{CONFIG_PATH} — set base_domain and acme_email, then re-run setup"
+    return
+  end
+
+  if config["bind_ip"] != ip
+    note "config bind_ip is #{config['bind_ip'].inspect} but this box answers on #{ip}"
+  end
+
+  step "Writing #{CADDYFILE} (needs sudo)"
+  caddyfile = <<~CADDY
+    # Managed by dev-env — per-environment sites live in #{SITES_DIR}/*.caddy
+    #
+    # default_bind pins listeners to the public address. A wildcard bind can fail
+    # with EADDRINUSE when something else (tailscaled, for one) already holds :443
+    # on another interface.
+    {
+    	email #{config['acme_email']}
+    	default_bind #{config['bind_ip']}
+    }
+
+    import #{SITES_DIR}/*.caddy
+  CADDY
+  IO.popen(["sudo", "tee", CADDYFILE], "w") { |io| io.write(caddyfile) }
+  run("sudo", "mkdir", "-p", SITES_DIR)
+  run("sudo", "chown", "#{ENV['USER']}:caddy", SITES_DIR)
+  run("sudo", "chmod", "2775", SITES_DIR)
+  run("sudo", "systemctl", "restart", "caddy")
+
+  install_unit
+  ok "Ready. Add .dev-env.json to a project with: dev-env init"
+end
+
+def install_unit
+  FileUtils.mkdir_p(File.dirname(UNIT_PATH))
+  File.write(UNIT_PATH, <<~UNIT)
+    [Unit]
+    Description=dev-env %i
+    After=network-online.target
+
+    [Service]
+    Type=simple
+    EnvironmentFile=#{STATE_DIR}/%i.env
+    # A generated launcher per environment: it holds the project's own server
+    # command, which a shared template unit cannot express.
+    ExecStart=#{RUN_DIR}/%i.sh
+
+    Restart=on-failure
+    RestartSec=3
+    TimeoutStopSec=15
+    KillSignal=SIGTERM
+
+    StandardOutput=journal
+    StandardError=journal
+    SyslogIdentifier=dev-env-%i
+
+    [Install]
+    WantedBy=default.target
+  UNIT
+  systemctl("daemon-reload")
+end
+
+def cmd_init(_argv)
+  root = capture("git", "rev-parse", "--show-toplevel")
+  abort!("not inside a git repository") if root.empty?
+  path = File.join(root, ".dev-env.json")
+  abort!("#{path} already exists") if File.exist?(path)
+
+  File.write(path, JSON.pretty_generate({
+    "name" => File.basename(root),
+    "commands" => {
+      "install" => "bundle check || bundle install --jobs 4",
+      "schema"  => "bin/rails db:schema:load",
+      "migrate" => "bin/rails db:migrate",
+      "server"  => "bin/rails server -b 127.0.0.1 -p ${PORT}",
+    },
+    "env" => { "RAILS_ENV" => "development" },
+    "after_restore" => [],
+    "worktree_files" => {},
+  }) + "\n")
+  ok "Wrote #{path} — edit it to match this project, then: dev-env up <branch>"
+end
+
+# ---------------------------------------------------------------- up
+
+def cmd_up(argv)
+  options = { basic_auth: true, base: "origin/main" }
+  parser = OptionParser.new do |o|
+    o.banner = "Usage: dev-env up <branch> [options]"
+    o.on("--slot SLOT", "Pool slot to use (#{pool.join(', ')}); default: first free") { |v| options[:slot] = v }
+    o.on("--seed PATH", "Dump to restore (default: #{default_dump})") { |v| options[:seed] = v; options[:seed_given] = true }
+    o.on("--no-seed", "Skip the dump; build the schema from migrations") { options[:no_seed] = true }
+    o.on("--public", "Serve without HTTP basic auth") { options[:basic_auth] = false }
+    o.on("--base REF", "Base ref when the branch does not exist (default: origin/main)") { |v| options[:base] = v }
+  end
+  parser.parse!(argv)
+  branch = argv.shift
+  abort!(parser.banner) if branch.nil?
+
+  slot = allocate_slot(options[:slot])
+  key = key_for(slot)
+  domain = domain_for(slot)
+  database = database_for(key)
+  worktree = File.join(project["worktree_root"], slugify(branch))
+  port = free_port
+  seed = options[:no_seed] ? nil : (options[:seed] || default_dump)
+
+  FileUtils.mkdir_p([STATE_DIR, RUN_DIR, project["worktree_root"]])
+  install_unit unless File.exist?(UNIT_PATH)
+
+  # A half-built environment is worse than none: undo whatever was created if a
+  # later step fails, so the slot is free to retry.
+  rollback = []
+  begin
+    step "Creating worktree #{worktree} for #{branch}"
+    existed = Dir.exist?(worktree)
+    create_worktree(worktree, branch, options[:base])
+    rollback << -> { run("git", "-C", project["root"], "worktree", "remove", "--force", worktree, check: false, quiet: true) } unless existed
+    write_worktree_files(worktree, domain)
+
+    step "Creating database #{database}"
+    abort!("database #{database} already exists") if database_exists?(database)
+    run("createdb", database)
+    rollback << -> { run("dropdb", "--if-exists", database, check: false, quiet: true) }
+
+    build_environment(key, slot, branch, database, worktree, domain, port, seed, options)
+  rescue SystemExit, StandardError => error
+    note "Failed partway through — rolling back"
+    rollback.reverse_each { |undo| undo.call rescue nil }
+    FileUtils.rm_f([state_path(key), env_path(key), run_path(key), site_path(key)])
+    raise error
+  end
+end
+
+# A fixed pool bounds certificate issuance: each slot's two hostnames are issued
+# once and thereafter only renewed, and renewals do not count against Let's
+# Encrypt's weekly limit for new certificates.
+def allocate_slot(requested)
+  if requested
+    abort!("#{requested.inspect} is not a pool slot (#{pool.join(', ')})") unless pool.include?(requested)
+    if File.exist?(state_path(key_for(requested)))
+      abort!("slot #{requested} is in use by #{load_state(key_for(requested))['branch']}")
+    end
+    return requested
+  end
+
+  free = pool.find { |slot| !File.exist?(state_path(key_for(slot))) }
+  return free if free
+
+  in_use = pool.map { |slot| "  #{slot} → #{load_state(key_for(slot))['branch']}" }.join("\n")
+  abort!("all #{pool.length} slots for #{project['name']} are in use:\n#{in_use}\n\nFree one with: dev-env down <slot>")
+end
+
+def create_worktree(worktree, branch, base)
+  return ok("worktree already present") if Dir.exist?(worktree)
+
+  root = project["root"]
+  if capture("git", "-C", root, "worktree", "list", "--porcelain").include?("branch refs/heads/#{branch}\n")
+    abort!("branch #{branch.inspect} is already checked out in another worktree")
+  end
+
+  if system("git", "-C", root, "show-ref", "--verify", "--quiet", "refs/heads/#{branch}")
+    run("git", "-C", root, "worktree", "add", worktree, branch)
+  elsif system("git", "-C", root, "show-ref", "--verify", "--quiet", "refs/remotes/origin/#{branch}")
+    run("git", "-C", root, "worktree", "add", "--track", "-b", branch, worktree, "origin/#{branch}")
+  else
+    step "Branch #{branch} does not exist; creating it from #{base}"
+    run("git", "-C", root, "worktree", "add", "-b", branch, worktree, base)
+  end
+end
+
+# Untracked files a project needs in every worktree: gitignored secrets it cannot
+# check in, or settings branches predating a change would otherwise lack.
+def write_worktree_files(worktree, domain)
+  vars = {
+    "DOMAIN" => domain,
+    # For templates embedding the domain in a regex, where bare dots would match
+    # any character and quietly loosen host checking.
+    "DOMAIN_RE" => Regexp.escape(domain),
+    "TLD_LENGTH" => domain.count(".").to_s,
+    "ROOT" => project["root"],
+  }
+
+  Array(project["link_from_root"]).each do |pattern|
+    Dir.glob(File.join(project["root"], pattern)).each do |source|
+      target = File.join(worktree, source.delete_prefix(project["root"] + "/"))
+      FileUtils.mkdir_p(File.dirname(target))
+      FileUtils.ln_sf(source, target)
+    end
+  end
+
+  (project["worktree_files"] || {}).each do |relative, spec|
+    spec = { "content" => spec } if spec.is_a?(Array) || spec.is_a?(String)
+    guard = spec["unless_file_contains"]
+    if guard && File.exist?(File.join(worktree, guard["file"])) &&
+       File.read(File.join(worktree, guard["file"])).include?(guard["text"])
+      next
+    end
+
+    body = Array(spec["content"]).join("\n")
+    target = File.join(worktree, relative)
+    FileUtils.mkdir_p(File.dirname(target))
+    File.write(target, interpolate(body, vars) + "\n")
+    exclude_from_git(worktree, relative)
+    ok "Wrote #{relative} into the worktree"
+  end
+end
+
+# git reads info/exclude from the common git dir, not the per-worktree one, so
+# writing to the latter would be silently ignored.
+def exclude_from_git(worktree, relative)
+  git_dir = capture("git", "-C", worktree, "rev-parse", "--path-format=absolute", "--git-common-dir")
+  return if git_dir.empty?
+
+  path = File.join(git_dir, "info", "exclude")
+  FileUtils.mkdir_p(File.dirname(path))
+  existing = File.exist?(path) ? File.read(path) : ""
+  File.write(path, "#{existing.chomp}\n#{relative}\n") unless existing.include?(relative)
+end
+
+# systemd user units start with a minimal PATH, so version managers installed
+# under ~/.local/bin would not resolve. Carry an explicit one into both the
+# setup commands and the generated environment file.
+def base_env(vars)
+  {
+    "DATABASE_URL" => vars["DATABASE_URL"],
+    "PORT" => vars["PORT"],
+    "PATH" => "#{File.expand_path('~/.local/bin')}:/usr/local/bin:/usr/bin:/bin",
+  }
+end
+
+def build_environment(key, slot, branch, database, worktree, domain, port, seed, options)
+  vars = {
+    "DOMAIN" => domain, "PORT" => port.to_s, "DATABASE" => database,
+    "SLOT" => slot, "PROJECT" => project["name"], "WORKTREE" => worktree,
+    "DATABASE_URL" => "postgresql:///#{database}",
+  }
+  app_env = base_env(vars).merge(interpolate(project["env"] || {}, vars))
+  commands = interpolate(project["commands"], vars)
+
+  if commands["install"]
+    step "Installing dependencies"
+    shell(commands["install"], chdir: worktree, env: app_env)
+  end
+
+  if seed && !File.exist?(seed)
+    abort!("seed dump not found: #{seed}") if options[:seed_given]
+    note "No seed dump at #{seed} — starting with an empty database"
+    seed = nil
+  end
+
+  if seed
+    restore_dump(database, seed, worktree, app_env, vars)
+  elsif commands["schema"]
+    step "Loading schema"
+    shell(commands["schema"], chdir: worktree, env: app_env)
+  end
+
+  if commands["migrate"]
+    step "Running migrations"
+    shell(commands["migrate"], chdir: worktree, env: app_env)
+  end
+
+  password = options[:basic_auth] ? password_for(key) : nil
+
+  step "Writing configuration"
+  File.write(env_path(key), app_env.map { |k, v| "#{k}=#{v}" }.join("\n") + "\n")
+  write_launcher(key, worktree, commands.fetch("server") { abort!("no commands.server in .dev-env.json") })
+  write_site(key, domain, port, password)
+  File.write(state_path(key), JSON.pretty_generate({
+    "key" => key, "slot" => slot, "project" => project["name"], "branch" => branch,
+    "domain" => domain, "port" => port, "database" => database, "worktree" => worktree,
+    "basic_auth" => !password.nil?, "created_at" => Time.now.utc.iso8601,
+  }) + "\n")
+
+  step "Reloading Caddy"
+  caddy_reload
+
+  step "Starting #{unit(key)}"
+  systemctl("enable", "--now", unit(key))
+
+  note "Not answering on 127.0.0.1:#{port} yet — check: dev-env logs #{slot} -f" unless wait_for_boot(port)
+  ok "#{project['name']}/#{slot} is up"
+  print_summary(key)
+end
+
+def restore_dump(database, dump, worktree, app_env, vars)
+  step "Restoring #{dump} into #{database}"
+  run("pg_restore", "--no-owner", "--no-acl", "-d", database, dump, check: false)
+
+  Array(project["after_restore"]).each do |command|
+    shell(interpolate(command, vars), chdir: worktree, env: app_env)
+  end
+end
+
+def write_launcher(key, worktree, server)
+  File.write(run_path(key), <<~SH)
+    #!/bin/sh
+    # Generated by dev-env — regenerated on every `up`.
+    cd #{worktree} || exit 1
+    exec #{server}
+  SH
+  File.chmod(0o755, run_path(key))
+end
+
+def write_site(key, domain, port, password)
+  auth = ""
+  if password
+    hash = capture("caddy", "hash-password", "--plaintext", password)
+    abort!("caddy hash-password failed") if hash.empty?
+    auth = "\n\tbasic_auth {\n\t\tdev #{hash}\n\t}"
+  end
+
+  File.write(site_path(key), <<~SITE)
+    # Managed by dev-env — regenerated on `up`, parked on `down`.
+    #{domain}, app.#{domain} {
+    	reverse_proxy 127.0.0.1:#{port}#{auth}
+    }
+  SITE
+end
+
+def write_parking_site(key, slot)
+  domain = domain_for(slot)
+  File.write(site_path(key), <<~SITE)
+    # Managed by dev-env — placeholder so this slot's certificates stay renewed
+    # while it is free. Replaced when an environment claims the slot.
+    #{domain}, app.#{domain} {
+    	respond "#{project['name']}/#{slot} is free — claim it with: dev-env up <branch> --slot #{slot}" 200
+    }
+  SITE
+end
+
+def wait_for_boot(port, timeout: 90)
+  deadline = Time.now + timeout
+  while Time.now < deadline
+    begin
+      Net::HTTP.start("127.0.0.1", port, open_timeout: 2, read_timeout: 5) { |http| http.get("/") }
+      return true
+    rescue StandardError
+      sleep 2
+    end
+  end
+  false
+end
+
+def print_summary(key)
+  state = load_state(key)
+  puts
+  puts "  Marketing  https://#{state['domain']}"
+  puts "  App        https://app.#{state['domain']}"
+  puts(state["basic_auth"] ? "  Basic auth dev / #{password_for(key)}" : "  Basic auth \e[33mdisabled\e[0m")
+  puts "  Worktree   #{state['worktree']}"
+  puts "  Database   #{state['database']}  (port #{state['port']})"
+  puts
+  puts "  Logs       dev-env logs #{state['slot']} -f"
+  puts "  Tear down  dev-env down #{state['slot']}"
+  puts
+end
+
+# ---------------------------------------------------------------- lifecycle
+
+def resolve(slot_or_key)
+  return slot_or_key if File.exist?(state_path(slot_or_key))
+  key = key_for(slot_or_key)
+  return key if File.exist?(state_path(key))
+  abort!("no environment #{slot_or_key.inspect} for #{project['name']} (try: dev-env list)")
+end
+
+def cmd_down(argv)
+  options = { worktree: true, database: true }
+  parser = OptionParser.new do |o|
+    o.banner = "Usage: dev-env down <slot> [options]"
+    o.on("--keep-worktree", "Leave the git worktree in place") { options[:worktree] = false }
+    o.on("--keep-database", "Leave the postgres database in place") { options[:database] = false }
+  end
+  parser.parse!(argv)
+  abort!(parser.banner) if argv.empty?
+  key = resolve(argv.shift)
+  state = load_state(key)
+
+  step "Stopping #{unit(key)}"
+  systemctl("disable", "--now", unit(key), check: false)
+
+  step "Parking Caddy site"
+  # A placeholder rather than a deletion, so Caddy keeps renewing this slot's
+  # certificates and the next `up` needs no fresh issuance.
+  write_parking_site(key, state["slot"])
+  caddy_reload
+
+  if options[:database]
+    step "Dropping database #{state['database']}"
+    run("dropdb", "--if-exists", state["database"], check: false)
+  end
+
+  if options[:worktree]
+    step "Removing worktree #{state['worktree']}"
+    run("git", "-C", project["root"], "worktree", "remove", "--force", state["worktree"], check: false)
+  end
+
+  FileUtils.rm_f([state_path(key), env_path(key), run_path(key)])
+  ok "#{state['project']}/#{state['slot']} removed (password kept for reuse)"
+end
+
+def cmd_list(_argv)
+  keys = all_keys
+  if keys.empty?
+    puts "No environments."
+    return
+  end
+
+  rows = keys.map do |key|
+    state = load_state(key)
+    [state["project"].to_s, state["slot"].to_s, state["branch"].to_s,
+     state["port"].to_s, capture("systemctl", "--user", "is-active", unit(key)),
+     "https://#{state['domain']}"]
+  end
+  headers = %w[PROJECT SLOT BRANCH PORT STATUS URL]
+  widths = headers.each_with_index.map { |h, i| ([h] + rows.map { |r| r[i] }).map(&:length).max }
+
+  puts headers.each_with_index.map { |h, i| h.ljust(widths[i]) }.join("  ")
+  rows.each do |row|
+    cells = row.each_with_index.map { |c, i| c.ljust(widths[i]) }
+    cells[4] = "#{row[4] == 'active' ? "\e[32m" : "\e[31m"}#{cells[4]}\e[0m"
+    puts cells.join("  ")
+  end
+
+  free = pool.reject { |slot| keys.include?(key_for(slot)) }
+  puts "\nFree #{project['name']} slots: #{free.empty? ? '(none)' : free.join(', ')}"
+rescue SystemExit
+  # `list` is useful outside a project directory too; the summary line is not.
+end
+
+def cmd_creds(argv)
+  if argv.empty?
+    pool.each do |slot|
+      key = key_for(slot)
+      next unless File.exist?(secret_path(key))
+      status = File.exist?(state_path(key)) ? "" : "  \e[90m(slot free)\e[0m"
+      puts "#{slot}  https://#{domain_for(slot)}  dev / #{password_for(key)}#{status}"
+    end
+    return
+  end
+
+  key = key_for(argv.shift)
+  puts "URL      https://#{domain_for(load_state(key)['slot'])}"
+  puts "Username dev"
+  puts "Password #{password_for(key)}"
+end
+
+def cmd_logs(argv)
+  abort!("Usage: dev-env logs <slot> [-f]") if argv.empty?
+  key = resolve(argv.shift)
+  exec("journalctl", "--user", "-u", unit(key), *argv)
+end
+
+def cmd_restart(argv)
+  abort!("Usage: dev-env restart <slot>") if argv.empty?
+  key = resolve(argv.shift)
+  systemctl("restart", unit(key))
+  ok(wait_for_boot(load_state(key)["port"]) ? "Restarted #{key}" : "Restarted #{key}, not answering yet")
+end
+
+def cmd_seed(argv)
+  options = {}
+  parser = OptionParser.new do |o|
+    o.banner = "Usage: dev-env seed <slot> [--seed PATH]"
+    o.on("--seed PATH", "Dump to restore (default: #{default_dump})") { |v| options[:seed] = v }
+  end
+  parser.parse!(argv)
+  abort!(parser.banner) if argv.empty?
+  key = resolve(argv.shift)
+  state = load_state(key)
+  dump = options[:seed] || default_dump
+  abort!("seed dump not found: #{dump}") unless File.exist?(dump)
+
+  vars = {
+    "DOMAIN" => state["domain"], "PORT" => state["port"].to_s, "DATABASE" => state["database"],
+    "SLOT" => state["slot"], "PROJECT" => state["project"], "WORKTREE" => state["worktree"],
+    "DATABASE_URL" => "postgresql:///#{state['database']}",
+  }
+  app_env = base_env(vars).merge(interpolate(project["env"] || {}, vars))
+
+  step "Stopping #{unit(key)} while the database is rebuilt"
+  systemctl("stop", unit(key), check: false)
+
+  step "Recreating #{state['database']}"
+  run("dropdb", "--if-exists", state["database"])
+  run("createdb", state["database"])
+  restore_dump(state["database"], dump, state["worktree"], app_env, vars)
+
+  if (migrate = interpolate(project["commands"], vars)["migrate"])
+    step "Running migrations"
+    shell(migrate, chdir: state["worktree"], env: app_env)
+  end
+
+  systemctl("start", unit(key))
+  ok(wait_for_boot(state["port"]) ? "Reseeded #{key}" : "Reseeded #{key}, not answering yet")
+end
+
+def cmd_warm(_argv)
+  pool.each do |slot|
+    key = key_for(slot)
+    write_parking_site(key, slot) unless File.exist?(state_path(key))
+  end
+  caddy_reload
+
+  # Certificates are fetched lazily on first request, and the request that
+  # triggers issuance fails its own handshake, so retry until one succeeds.
+  failed = []
+  pool.each do |slot|
+    [domain_for(slot), "app.#{domain_for(slot)}"].each do |host|
+      code = nil
+      3.times do
+        code = capture("curl", "-s", "-o", "/dev/null", "-w", "%{http_code}", "--max-time", "45", "https://#{host}")
+        break unless code.empty? || code == "000"
+        sleep 3
+      end
+      bad = code.empty? || code == "000"
+      failed << host if bad
+      puts(bad ? "  \e[31m✗\e[0m #{host}" : "  \e[32m✓\e[0m #{host} (#{code})")
+    end
+  end
+
+  abort!("could not obtain certificates for: #{failed.join(', ')}") if failed.any?
+  ok "Certificates warmed for #{project['name']}"
+end
+
+USAGE = <<~TEXT
+  Usage: dev-env <command> [options]
+
+  Per machine:
+    setup             Detect the public address, write the Caddy config and unit
+  Per project (run inside its repository):
+    init              Write a starter .dev-env.json
+    up <branch>       Claim a free slot: worktree, database and service
+    down <slot>       Tear an environment down and free its slot
+    list              Show every environment, and this project's free slots
+    creds [slot]      Show the basic-auth credentials
+    logs <slot> [-f]  Follow the log
+    restart <slot>    Restart the service
+    seed <slot>       Rebuild the database from the seed dump
+    warm              Pre-issue certificates for every slot
+
+  Environments occupy a fixed per-project pool, served at
+  https://<slot>.<project>.<base domain> and https://app.<slot>.<project>.<base domain>
+TEXT
+
+case (command = ARGV.shift)
+when "setup"   then cmd_setup(ARGV)
+when "init"    then cmd_init(ARGV)
+when "up"      then cmd_up(ARGV)
+when "down"    then cmd_down(ARGV)
+when "list"    then cmd_list(ARGV)
+when "creds"   then cmd_creds(ARGV)
+when "logs"    then cmd_logs(ARGV)
+when "restart" then cmd_restart(ARGV)
+when "seed"    then cmd_seed(ARGV)
+when "warm"    then cmd_warm(ARGV)
+when nil, "-h", "--help", "help" then puts USAGE
+else
+  warn "Unknown command: #{command}\n\n#{USAGE}"
+  exit 1
+end
