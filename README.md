@@ -15,7 +15,8 @@ dev-env logs <slot> -f  # follow the log
 dev-env down <slot>     # tear down and free the slot
 ```
 
-Environments are served at `https://dev<N>.<project>.<base domain>` and
+Environments are served at `https://dev<N>.<project>.<base domain>`, plus one
+hostname per subdomain the project declares — by default `app.`, so
 `https://app.dev<N>.<project>.<base domain>`.
 
 ## Setting up a machine
@@ -48,6 +49,7 @@ Keys, all optional except `commands.server`:
 | Key | Purpose |
 | --- | --- |
 | `name` | Hostname component; defaults to the repository directory name |
+| `subdomains` | Hostnames to serve, and which sit behind basic auth |
 | `commands` | `install`, `schema`, `migrate`, `server` |
 | `env` | Environment variables for those commands and the service |
 | `after_restore` | Commands to run after a dump is restored |
@@ -56,7 +58,37 @@ Keys, all optional except `commands.server`:
 | `pool_size`, `seed`, `worktree_root` | Override the defaults |
 
 `${DOMAIN}`, `${DOMAIN_RE}`, `${PORT}`, `${DATABASE}`, `${DATABASE_URL}`,
-`${SLOT}`, `${PROJECT}`, `${WORKTREE}` and `${TLD_LENGTH}` are interpolated.
+`${SLOT}`, `${PROJECT}`, `${WORKTREE}` and `${TLD_LENGTH}` are interpolated, as
+are `${<SUB>_DOMAIN}` and `${<SUB>_DOMAIN_RE}` for each declared subdomain — an
+`mcp` subdomain gives `${MCP_DOMAIN}` and `${MCP_DOMAIN_RE}`.
+
+## Subdomains
+
+Every environment answers on the bare hostname and on `app.` unless the project
+says otherwise. `subdomains` replaces that list, and decides which hostnames sit
+behind basic auth:
+
+```json
+"subdomains": {
+  "":    { "auth": true },
+  "app": { "auth": true },
+  "mcp": { "auth": false }
+}
+```
+
+`""` is the bare hostname, `auth` defaults to `true`, and a bare `true` or
+`false` is shorthand for the flag on its own. An endpoint authenticating its own
+callers — an MCP server presenting a bearer token, a webhook receiver — wants
+`"auth": false`, since a basic-auth prompt in front of it turns every request
+into a 401 the client cannot answer.
+
+`dev-env up --public` still overrides the lot and serves every hostname open.
+
+Caddy cannot vary basic auth between hostnames inside one site block, so the
+guarded and open hostnames become two blocks over the same backend. Adding a
+subdomain to a project whose environments are already up takes effect on
+`dev-env warm`, which rewrites every slot's Caddy site and fetches any
+certificate the new hostname needs.
 
 ## Seed data
 

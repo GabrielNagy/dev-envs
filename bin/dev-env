@@ -102,9 +102,13 @@ DEFAULT_PROJECT = {
   "env" => {},
   "after_restore" => [],
   "worktree_files" => {},
+  "subdomains" => nil,
   "pool_size" => nil,
   "seed" => nil,
 }.freeze
+
+# "" is the bare hostname; every other key becomes a label in front of it.
+DEFAULT_SUBDOMAINS = { "" => { "auth" => true }, "app" => { "auth" => true } }.freeze
 
 # Everything about a project is derived from the repository it is run in, so the
 # same tool serves any number of them.
@@ -141,6 +145,52 @@ end
 def pool = (1..Integer(project["pool_size"])).map { |n| "dev#{n}" }
 def key_for(slot) = "#{project['name']}-#{slot}"
 def domain_for(slot) = "#{slot}.#{project['name']}.#{config['base_domain']}"
+
+# The hostnames one environment answers on. A project declares them as
+# {"": {"auth": true}, "mcp": {"auth": false}}; a bare true or false is
+# shorthand for the auth flag alone, which defaults to true.
+def subdomains
+  @subdomains ||= begin
+    raw = project["subdomains"] || DEFAULT_SUBDOMAINS
+    abort!("subdomains in .dev-env.json must be an object") unless raw.is_a?(Hash)
+    abort!("subdomains in .dev-env.json is empty") if raw.empty?
+
+    raw.map do |label, spec|
+      spec = { "auth" => spec } if [true, false].include?(spec)
+      spec = {} if spec.nil?
+      abort!("subdomain #{label.inspect} must be an object or a boolean") unless spec.is_a?(Hash)
+      # One label only: a wildcard DNS record covers a single level, so a dotted
+      # subdomain would need its own record to resolve at all.
+      unless label.empty? || label.match?(/\A[a-z0-9]([a-z0-9-]*[a-z0-9])?\z/)
+        abort!("#{label.inspect} is not a usable subdomain label")
+      end
+      { "label" => label, "auth" => spec.fetch("auth", true) }
+    end
+  end
+end
+
+def host_for(domain, label) = label.empty? ? domain : "#{label}.#{domain}"
+def hosts_for(domain) = subdomains.map { |sub| host_for(domain, sub["label"]) }
+
+# Hostname interpolation vars: ${DOMAIN} for the bare hostname, plus a
+# ${MCP_DOMAIN} and ${MCP_DOMAIN_RE} for each declared subdomain. The _RE forms
+# are escaped for templates embedding a hostname in a regex, where bare dots
+# would match any character and quietly loosen host checking.
+def domain_vars(domain)
+  vars = {
+    "DOMAIN" => domain,
+    "DOMAIN_RE" => Regexp.escape(domain),
+    "TLD_LENGTH" => domain.count(".").to_s,
+  }
+  subdomains.each do |sub|
+    next if sub["label"].empty?
+    name = sub["label"].tr("-", "_").upcase
+    host = host_for(domain, sub["label"])
+    vars["#{name}_DOMAIN"] = host
+    vars["#{name}_DOMAIN_RE"] = Regexp.escape(host)
+  end
+  vars
+end
 
 def state_path(key)  = File.join(STATE_DIR, "#{key}.json")
 def env_path(key)    = File.join(STATE_DIR, "#{key}.env")
@@ -287,6 +337,7 @@ def cmd_init(_argv)
       "server"  => "bin/rails server -b 127.0.0.1 -p ${PORT}",
     },
     "env" => { "RAILS_ENV" => "development" },
+    "subdomains" => { "" => { "auth" => true }, "app" => { "auth" => true } },
     "after_restore" => [],
     "worktree_files" => {},
   }) + "\n")
@@ -344,9 +395,10 @@ def cmd_up(argv)
   end
 end
 
-# A fixed pool bounds certificate issuance: each slot's two hostnames are issued
-# once and thereafter only renewed, and renewals do not count against Let's
-# Encrypt's weekly limit for new certificates.
+# A fixed pool bounds certificate issuance: each slot's hostnames are issued once
+# and thereafter only renewed, and renewals do not count against Let's Encrypt's
+# weekly limit for new certificates. A project declaring more subdomains
+# multiplies that one-off count by the pool size, not the rate of renewal.
 def allocate_slot(requested)
   if requested
     abort!("#{requested.inspect} is not a pool slot (#{pool.join(', ')})") unless pool.include?(requested)
@@ -384,14 +436,7 @@ end
 # Untracked files a project needs in every worktree: gitignored secrets it cannot
 # check in, or settings branches predating a change would otherwise lack.
 def write_worktree_files(worktree, domain)
-  vars = {
-    "DOMAIN" => domain,
-    # For templates embedding the domain in a regex, where bare dots would match
-    # any character and quietly loosen host checking.
-    "DOMAIN_RE" => Regexp.escape(domain),
-    "TLD_LENGTH" => domain.count(".").to_s,
-    "ROOT" => project["root"],
-  }
+  vars = domain_vars(domain).merge("ROOT" => project["root"])
 
   Array(project["link_from_root"]).each do |pattern|
     Dir.glob(File.join(project["root"], pattern)).each do |source|
@@ -442,11 +487,11 @@ def base_env(vars)
 end
 
 def build_environment(key, slot, branch, database, worktree, domain, port, seed, options)
-  vars = {
-    "DOMAIN" => domain, "PORT" => port.to_s, "DATABASE" => database,
+  vars = domain_vars(domain).merge(
+    "PORT" => port.to_s, "DATABASE" => database,
     "SLOT" => slot, "PROJECT" => project["name"], "WORKTREE" => worktree,
     "DATABASE_URL" => "postgresql:///#{database}",
-  }
+  )
   app_env = base_env(vars).merge(interpolate(project["env"] || {}, vars))
   commands = interpolate(project["commands"], vars)
 
@@ -473,7 +518,10 @@ def build_environment(key, slot, branch, database, worktree, domain, port, seed,
     shell(commands["migrate"], chdir: worktree, env: app_env)
   end
 
-  password = options[:basic_auth] ? password_for(key) : nil
+  # A password is pointless if no hostname is behind it, and claiming otherwise
+  # in the summary would be worse than saying nothing.
+  guarded = options[:basic_auth] && subdomains.any? { |sub| sub["auth"] }
+  password = guarded ? password_for(key) : nil
 
   step "Writing configuration"
   File.write(env_path(key), app_env.map { |k, v| "#{k}=#{v}" }.join("\n") + "\n")
@@ -523,9 +571,23 @@ def write_site(key, domain, port, password)
     auth = "\n\tbasic_auth {\n\t\t#{basic_auth_user} #{hash}\n\t}"
   end
 
-  File.write(site_path(key), <<~SITE)
+  # Caddy cannot vary basic_auth between hostnames within one site block, so the
+  # guarded and open hostnames become separate blocks over the same backend.
+  guarded, open = subdomains.partition { |sub| password && sub["auth"] }
+  blocks = []
+  blocks << proxy_block(hosts(domain, guarded), port, auth) if guarded.any?
+  blocks << proxy_block(hosts(domain, open), port, "") if open.any?
+
+  File.write(site_path(key), <<~HEADER + blocks.join("\n"))
     # Managed by dev-env — regenerated on `up`, parked on `down`.
-    #{domain}, app.#{domain} {
+  HEADER
+end
+
+def hosts(domain, subs) = subs.map { |sub| host_for(domain, sub["label"]) }.join(", ")
+
+def proxy_block(hosts, port, auth)
+  <<~SITE
+    #{hosts} {
     	reverse_proxy 127.0.0.1:#{port}#{auth}
     }
   SITE
@@ -536,7 +598,7 @@ def write_parking_site(key, slot)
   File.write(site_path(key), <<~SITE)
     # Managed by dev-env — placeholder so this slot's certificates stay renewed
     # while it is free. Replaced when an environment claims the slot.
-    #{domain}, app.#{domain} {
+    #{hosts_for(domain).join(', ')} {
     	respond "#{project['name']}/#{slot} is free — claim it with: dev-env up <branch> --slot #{slot}" 200
     }
   SITE
@@ -558,8 +620,11 @@ end
 def print_summary(key)
   state = load_state(key)
   puts
-  puts "  Marketing  https://#{state['domain']}"
-  puts "  App        https://app.#{state['domain']}"
+  subdomains.each_with_index do |sub, index|
+    label = index.zero? ? "URLs" : ""
+    open = state["basic_auth"] && !sub["auth"] ? "  \e[33m(no auth)\e[0m" : ""
+    puts "  #{label.ljust(10)} https://#{host_for(state['domain'], sub['label'])}#{open}"
+  end
   puts(state["basic_auth"] ? "  Basic auth #{basic_auth_user} / #{password_for(key)}" : "  Basic auth \e[33mdisabled\e[0m")
   puts "  Worktree   #{state['worktree']}"
   puts "  Database   #{state['database']}  (port #{state['port']})"
@@ -643,18 +708,28 @@ rescue SystemExit
 end
 
 def cmd_creds(argv)
+  guarded = subdomains.select { |sub| sub["auth"] }
+  if guarded.empty?
+    puts "No hostname for #{project['name']} is behind basic auth."
+    return
+  end
+
   if argv.empty?
     pool.each do |slot|
       key = key_for(slot)
       next unless File.exist?(secret_path(key))
       status = File.exist?(state_path(key)) ? "" : "  \e[90m(slot free)\e[0m"
-      puts "#{slot}  https://#{domain_for(slot)}  #{basic_auth_user} / #{password_for(key)}#{status}"
+      host = host_for(domain_for(slot), guarded.first["label"])
+      puts "#{slot}  https://#{host}  #{basic_auth_user} / #{password_for(key)}#{status}"
     end
     return
   end
 
   key = key_for(argv.shift)
-  puts "URL      https://#{domain_for(load_state(key)['slot'])}"
+  domain = domain_for(load_state(key)["slot"])
+  guarded.each_with_index do |sub, index|
+    puts "#{index.zero? ? 'URLs' : ''.ljust(4)}     https://#{host_for(domain, sub['label'])}"
+  end
   puts "Username #{basic_auth_user}"
   puts "Password #{password_for(key)}"
 end
@@ -685,11 +760,11 @@ def cmd_seed(argv)
   dump = options[:seed] || default_dump
   abort!("seed dump not found: #{dump}") unless File.exist?(dump)
 
-  vars = {
-    "DOMAIN" => state["domain"], "PORT" => state["port"].to_s, "DATABASE" => state["database"],
+  vars = domain_vars(state["domain"]).merge(
+    "PORT" => state["port"].to_s, "DATABASE" => state["database"],
     "SLOT" => state["slot"], "PROJECT" => state["project"], "WORKTREE" => state["worktree"],
     "DATABASE_URL" => "postgresql:///#{state['database']}",
-  }
+  )
   app_env = base_env(vars).merge(interpolate(project["env"] || {}, vars))
 
   step "Stopping #{unit(key)} while the database is rebuilt"
@@ -710,9 +785,17 @@ def cmd_seed(argv)
 end
 
 def cmd_warm(_argv)
+  # Every slot's site file is rewritten, not just the free ones': a subdomain
+  # added to .dev-env.json after an environment came up would otherwise go
+  # unserved until that slot's next `up`.
   pool.each do |slot|
     key = key_for(slot)
-    write_parking_site(key, slot) unless File.exist?(state_path(key))
+    unless File.exist?(state_path(key))
+      write_parking_site(key, slot)
+      next
+    end
+    state = load_state(key)
+    write_site(key, state["domain"], state["port"], state["basic_auth"] ? password_for(key) : nil)
   end
   caddy_reload
 
@@ -720,7 +803,7 @@ def cmd_warm(_argv)
   # triggers issuance fails its own handshake, so retry until one succeeds.
   failed = []
   pool.each do |slot|
-    [domain_for(slot), "app.#{domain_for(slot)}"].each do |host|
+    hosts_for(domain_for(slot)).each do |host|
       code = nil
       3.times do
         code = capture("curl", "-s", "-o", "/dev/null", "-w", "%{http_code}", "--max-time", "45", "https://#{host}")
@@ -751,10 +834,11 @@ USAGE = <<~TEXT
     logs <slot> [-f]  Follow the log
     restart <slot>    Restart the service
     seed <slot>       Rebuild the database from the seed dump
-    warm              Pre-issue certificates for every slot
+    warm              Rewrite every slot's Caddy site and pre-issue certificates
 
   Environments occupy a fixed per-project pool, served at
-  https://<slot>.<project>.<base domain> and https://app.<slot>.<project>.<base domain>
+  https://<subdomain>.<slot>.<project>.<base domain>, with the subdomains and
+  which of them sit behind basic auth declared in .dev-env.json
 TEXT
 
 case (command = ARGV.shift)
