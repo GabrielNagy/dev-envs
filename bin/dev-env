@@ -110,11 +110,19 @@ DEFAULT_PROJECT = {
 # same tool serves any number of them.
 def project
   @project ||= begin
-    root = capture("git", "rev-parse", "--show-toplevel")
-    abort!("not inside a git repository") if root.empty?
+    here = capture("git", "rev-parse", "--show-toplevel")
+    abort!("not inside a git repository") if here.empty?
 
-    path = File.join(root, ".dev-env.json")
-    abort!("no .dev-env.json in #{root} — run: dev-env init") unless File.exist?(path)
+    # Worktrees share a common git dir with the primary checkout. Derive the
+    # latter from it, so running this from inside one worktree does not nest new
+    # worktrees underneath it.
+    common = capture("git", "rev-parse", "--path-format=absolute", "--git-common-dir")
+    root = common.empty? ? here : File.dirname(common)
+
+    # Prefer the config in the checkout being used, so a branch can change it
+    # before the primary checkout has the change.
+    path = [File.join(here, ".dev-env.json"), File.join(root, ".dev-env.json")].find { |p| File.exist?(p) }
+    abort!("no .dev-env.json in #{here} — run: dev-env init") if path.nil?
 
     settings = DEFAULT_PROJECT.merge(JSON.parse(File.read(path)))
     settings["commands"] = DEFAULT_PROJECT["commands"].merge(settings["commands"] || {})
