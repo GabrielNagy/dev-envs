@@ -183,6 +183,8 @@ def database_exists?(name)
   capture("psql", "-tAc", "SELECT 1 FROM pg_database WHERE datname = '#{name}'") == "1"
 end
 
+def basic_auth_user = config.fetch("basic_auth_user", "dev")
+
 def caddy_reload = run("caddy", "reload", "--config", CADDYFILE, quiet: true)
 def systemctl(*args, check: true) = run("systemctl", "--user", *args, check: check, quiet: true)
 
@@ -510,7 +512,7 @@ def write_site(key, domain, port, password)
   if password
     hash = capture("caddy", "hash-password", "--plaintext", password)
     abort!("caddy hash-password failed") if hash.empty?
-    auth = "\n\tbasic_auth {\n\t\tdev #{hash}\n\t}"
+    auth = "\n\tbasic_auth {\n\t\t#{basic_auth_user} #{hash}\n\t}"
   end
 
   File.write(site_path(key), <<~SITE)
@@ -550,7 +552,7 @@ def print_summary(key)
   puts
   puts "  Marketing  https://#{state['domain']}"
   puts "  App        https://app.#{state['domain']}"
-  puts(state["basic_auth"] ? "  Basic auth dev / #{password_for(key)}" : "  Basic auth \e[33mdisabled\e[0m")
+  puts(state["basic_auth"] ? "  Basic auth #{basic_auth_user} / #{password_for(key)}" : "  Basic auth \e[33mdisabled\e[0m")
   puts "  Worktree   #{state['worktree']}"
   puts "  Database   #{state['database']}  (port #{state['port']})"
   puts
@@ -638,14 +640,14 @@ def cmd_creds(argv)
       key = key_for(slot)
       next unless File.exist?(secret_path(key))
       status = File.exist?(state_path(key)) ? "" : "  \e[90m(slot free)\e[0m"
-      puts "#{slot}  https://#{domain_for(slot)}  dev / #{password_for(key)}#{status}"
+      puts "#{slot}  https://#{domain_for(slot)}  #{basic_auth_user} / #{password_for(key)}#{status}"
     end
     return
   end
 
   key = key_for(argv.shift)
   puts "URL      https://#{domain_for(load_state(key)['slot'])}"
-  puts "Username dev"
+  puts "Username #{basic_auth_user}"
   puts "Password #{password_for(key)}"
 end
 
