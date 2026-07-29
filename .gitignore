@@ -2,3 +2,4 @@ envs/
 run/
 secrets/
 dumps/
+config.json
