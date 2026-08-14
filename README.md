@@ -33,6 +33,36 @@ environments survive logout: `loginctl enable-linger $USER`.
 
 `config.json` is machine-local and gitignored — see `config.example.json`.
 
+## Existing worktrees
+
+`up` does not need a branch of its own. If the branch is already checked out —
+by an agent, or by hand, anywhere on disk — that checkout is the one served:
+
+```sh
+dev-env up feature-x                          # finds and adopts an existing checkout
+dev-env up feature-x --worktree ~/some/path   # or point at one explicitly
+```
+
+Otherwise `up` creates a worktree as before, from the local branch, from
+`origin/<branch>`, or from `--base` when the branch is new.
+
+`down` removes a worktree only when `dev-env` created it. `git worktree remove
+--force` discards uncommitted work and cannot be undone, so removal needs
+positive evidence of ownership rather than the absence of a reason to stop:
+
+| `up` recorded | `down` does |
+| --- | --- |
+| it created the worktree | removes it, unless `--keep-worktree` |
+| it adopted the worktree | never removes it; no flag overrides this |
+| nothing — the environment predates ownership tracking | leaves it, unless `--remove-worktree` |
+
+That last row matters because older versions silently adopted a worktree already
+sitting at the default path, which is exactly where agents put theirs. Such an
+environment cannot prove the checkout is its own, so it leaves it behind and says
+so. Use `--remove-worktree` once you have checked.
+
+The `up` summary marks an adopted worktree.
+
 ## Setting up a project
 
 ```sh

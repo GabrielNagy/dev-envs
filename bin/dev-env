@@ -355,6 +355,7 @@ def cmd_up(argv)
     o.on("--no-seed", "Skip the dump; build the schema from migrations") { options[:no_seed] = true }
     o.on("--public", "Serve without HTTP basic auth") { options[:basic_auth] = false }
     o.on("--base REF", "Base ref when the branch does not exist (default: origin/main)") { |v| options[:base] = v }
+    o.on("--worktree PATH", "Serve an existing checkout instead of creating one") { |v| options[:worktree_path] = v }
   end
   parser.parse!(argv)
   branch = argv.shift
@@ -364,7 +365,12 @@ def cmd_up(argv)
   key = key_for(slot)
   domain = domain_for(slot)
   database = database_for(key)
-  worktree = File.join(project["worktree_root"], slugify(branch))
+  # git allows a branch in only one worktree, so a checkout that already exists is the one to
+  # serve, not a conflict to refuse. An agent's worktree is the common case.
+  worktree = options[:worktree_path] || existing_worktree_for(branch) ||
+             File.join(project["worktree_root"], slugify(branch))
+  worktree = File.expand_path(worktree)
+  verify_adopted_worktree(worktree, branch) if Dir.exist?(worktree)
   port = free_port
   seed = options[:no_seed] ? nil : (options[:seed] || default_dump)
 
@@ -375,8 +381,11 @@ def cmd_up(argv)
   # later step fails, so the slot is free to retry.
   rollback = []
   begin
-    step "Creating worktree #{worktree} for #{branch}"
     existed = Dir.exist?(worktree)
+    step existed ? "Using existing worktree #{worktree} for #{branch}"
+                 : "Creating worktree #{worktree} for #{branch}"
+    # Only a worktree this command created may be torn down by it, on rollback or on `down`.
+    options[:worktree_owned] = !existed
     create_worktree(worktree, branch, options[:base])
     rollback << -> { run("git", "-C", project["root"], "worktree", "remove", "--force", worktree, check: false, quiet: true) } unless existed
     write_worktree_files(worktree, domain)
@@ -413,6 +422,30 @@ def allocate_slot(requested)
 
   in_use = pool.map { |slot| "  #{slot} → #{load_state(key_for(slot))['branch']}" }.join("\n")
   abort!("all #{pool.length} slots for #{project['name']} are in use:\n#{in_use}\n\nFree one with: dev-env down <slot>")
+end
+
+# The path of the worktree this repository already has checked out on `branch`, or nil.
+def existing_worktree_for(branch)
+  path = nil
+  capture("git", "-C", project["root"], "worktree", "list", "--porcelain").each_line do |line|
+    line = line.chomp
+    path = line.delete_prefix("worktree ") if line.start_with?("worktree ")
+    return path if line == "branch refs/heads/#{branch}"
+  end
+  nil
+end
+
+# A checkout dev-env did not create is only usable if it really is this repository's, on this
+# branch. Serving someone else's directory would be silently wrong in both directions.
+def verify_adopted_worktree(worktree, branch)
+  common = capture("git", "-C", worktree, "rev-parse", "--path-format=absolute", "--git-common-dir")
+  abort!("#{worktree} is not a git worktree") if common.empty?
+  unless File.dirname(common) == project["root"]
+    abort!("#{worktree} belongs to #{File.dirname(common)}, not #{project['root']}")
+  end
+  head = capture("git", "-C", worktree, "rev-parse", "--abbrev-ref", "HEAD")
+  return if head == branch
+  abort!("#{worktree} is on #{head.inspect}, not #{branch.inspect}")
 end
 
 def create_worktree(worktree, branch, base)
@@ -530,6 +563,7 @@ def build_environment(key, slot, branch, database, worktree, domain, port, seed,
   File.write(state_path(key), JSON.pretty_generate({
     "key" => key, "slot" => slot, "project" => project["name"], "branch" => branch,
     "domain" => domain, "port" => port, "database" => database, "worktree" => worktree,
+    "worktree_owned" => options.fetch(:worktree_owned, true),
     "basic_auth" => !password.nil?, "created_at" => Time.now.utc.iso8601,
   }) + "\n")
 
@@ -626,7 +660,7 @@ def print_summary(key)
     puts "  #{label.ljust(10)} https://#{host_for(state['domain'], sub['label'])}#{open}"
   end
   puts(state["basic_auth"] ? "  Basic auth #{basic_auth_user} / #{password_for(key)}" : "  Basic auth \e[33mdisabled\e[0m")
-  puts "  Worktree   #{state['worktree']}"
+  puts "  Worktree   #{state['worktree']}#{state['worktree_owned'] ? '' : ' (adopted; kept on down)'}"
   puts "  Database   #{state['database']}  (port #{state['port']})"
   puts
   puts "  Logs       dev-env logs #{state['slot']} -f"
@@ -648,6 +682,7 @@ def cmd_down(argv)
   parser = OptionParser.new do |o|
     o.banner = "Usage: dev-env down <slot> [options]"
     o.on("--keep-worktree", "Leave the git worktree in place") { options[:worktree] = false }
+    o.on("--remove-worktree", "Remove a worktree whose origin predates ownership tracking") { options[:force_worktree] = true }
     o.on("--keep-database", "Leave the postgres database in place") { options[:database] = false }
   end
   parser.parse!(argv)
@@ -669,9 +704,24 @@ def cmd_down(argv)
     run("dropdb", "--if-exists", state["database"], check: false)
   end
 
-  if options[:worktree]
+  # `remove --force` discards uncommitted work and cannot be undone, so removal requires positive
+  # evidence that dev-env created this worktree. Three states, not two:
+  #   true  — dev-env created it; remove it.
+  #   false — adopted from elsewhere; never remove it, and no flag overrides that.
+  #   nil   — written before ownership was recorded, so unknown. Older `up` silently adopted a
+  #           worktree that already sat at the default path, which is exactly where agents put
+  #           theirs, so "unknown" cannot be treated as "ours". Left alone unless forced.
+  owned = state["worktree_owned"]
+  if !options[:worktree]
+    note "Leaving worktree #{state['worktree']} (--keep-worktree)" if owned
+  elsif owned == true || (owned.nil? && options[:force_worktree])
     step "Removing worktree #{state['worktree']}"
     run("git", "-C", project["root"], "worktree", "remove", "--force", state["worktree"], check: false)
+  elsif owned == false
+    note "Leaving worktree #{state['worktree']} — dev-env did not create it"
+  else
+    note "Leaving worktree #{state['worktree']} — predates ownership tracking, so it may be " \
+         "an adopted checkout. Remove it yourself, or re-run with --remove-worktree."
   end
 
   FileUtils.rm_f([state_path(key), env_path(key), run_path(key)])
