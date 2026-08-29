@@ -49,6 +49,13 @@ module DevEnv
     def link_from_root  = Array(@settings["link_from_root"])
     def worktree_files  = @settings["worktree_files"] || {}
 
+    def public?
+      value = @settings.fetch("public", false)
+      raise Error, "public in .dev-env.json must be true or false" unless [true, false].include?(value)
+
+      value
+    end
+
     # Worktrees sit in a container folder beside the checkout, never loose in
     # the parent directory.
     def worktree_root

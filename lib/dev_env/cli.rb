@@ -114,6 +114,7 @@ module DevEnv
           "server"  => "bin/rails server -b 127.0.0.1 -p ${PORT}",
         },
         "env" => { "RAILS_ENV" => "development" },
+        "public" => false,
         "subdomains" => { "" => { "auth" => true }, "app" => { "auth" => true } },
         "after_restore" => [],
         "after_down" => [],
@@ -126,13 +127,14 @@ module DevEnv
 
     def cmd_up(argv)
       started_at = monotonic_time
-      options = { basic_auth: true, base: "origin/main" }
+      options = { public: project.public?, base: "origin/main" }
       parser = OptionParser.new do |o|
         o.banner = "Usage: dev-env up [branch] [options]"
         o.on("--id ID", "Hostname identifier: a lowercase DNS label of at most 8 characters (default: random)") { |v| options[:id] = v }
         o.on("--seed PATH", "Dump to restore (default: #{project.default_dump})") { |v| options[:seed] = v; options[:seed_given] = true }
         o.on("--no-seed", "Skip the dump; build the schema from migrations") { options[:no_seed] = true }
-        o.on("--public", "Serve without HTTP basic auth") { options[:basic_auth] = false }
+        o.on("--public", "Serve without HTTP basic auth (overrides .dev-env.json)") { options[:public] = true }
+        o.on("--private", "Serve with configured basic auth (overrides .dev-env.json)") { options[:public] = false }
         o.on("--base REF", "Base ref when the branch does not exist (default: origin/main)") { |v| options[:base] = v }
         o.on("--worktree PATH", "Serve an existing checkout instead of creating one") { |v| options[:worktree_path] = v }
       end
@@ -169,7 +171,7 @@ module DevEnv
           "port" => port, "database" => database, "worktree" => worktree,
           # Only a worktree this command created may be torn down by it, on rollback or on `down`.
           "worktree_owned" => !Dir.exist?(worktree),
-          "basic_auth" => options[:basic_auth] && project.subdomains.any? { |sub| sub["auth"] },
+          "basic_auth" => !options[:public] && project.subdomains.any? { |sub| sub["auth"] },
           "process_manager" => project.process_manager,
           "database_settings" => project.database_settings,
           "created_at" => Time.now.utc.iso8601,
@@ -316,7 +318,12 @@ module DevEnv
         return
       end
 
-      domain = store.load(key)["domain"]
+      state = store.load(key)
+      unless state["basic_auth"]
+        return puts("#{state['project']}/#{state['branch']} is public; it has no basic-auth credentials.")
+      end
+
+      domain = state["domain"]
       guarded.each_with_index do |sub, index|
         label = index.zero? ? "URLs" : "".ljust(4)
         puts "#{color(label, BOLD)}     #{color("https://#{project.host_for(domain, sub['label'])}", CYAN)}"

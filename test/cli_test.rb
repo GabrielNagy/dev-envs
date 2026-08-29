@@ -45,6 +45,31 @@ class CLITest < Minitest::Test
     dropped
   end
 
+  # Runs enough of `up` to capture the state it would persist, while replacing
+  # the database and build phases that need machine services.
+  def up_state_for(settings, *auth_options)
+    state = nil
+    cli = DevEnv::CLI.new(config: @config)
+    in_project("proj", settings) do
+      system("git", "add", ".dev-env.json")
+      system("git", "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "initial")
+      system("git", "checkout", "-qb", "feature")
+
+      cli.send(:systemd).define_singleton_method(:installed?) { true }
+      database = Object.new
+      database.define_singleton_method(:exists?) { |_| false }
+      database.define_singleton_method(:create) { |_| true }
+      cli.define_singleton_method(:database_for) { |_| database }
+      cli.define_singleton_method(:build_environment) { |candidate, *| state = candidate }
+      cli.define_singleton_method(:print_summary) { |_, total:| total }
+
+      capture_io do
+        cli.send(:cmd_up, ["feature", "--worktree", Dir.pwd, "--no-seed", *auth_options])
+      end
+    end
+    state
+  end
+
   def test_help_prints_usage
     out, = capture_io { @cli.start(["help"]) }
     assert_includes out, "Usage: dev-env <command>"
@@ -72,6 +97,7 @@ class CLITest < Minitest::Test
       settings = JSON.parse(File.read(".dev-env.json"))
       assert_equal File.basename(repo), settings["name"]
       assert settings.dig("commands", "server")
+      assert_equal false, settings["public"]
 
       _, err = capture_io { assert_raises(SystemExit) { DevEnv::CLI.new(config: build_config).start(["init"]) } }
       assert_includes err, "already exists"
@@ -124,6 +150,16 @@ class CLITest < Minitest::Test
       error = assert_raises(DevEnv::Error) { @cli.send(:cmd_up, []) }
       assert_includes error.message, "already has an environment", "expected the checked-out branch to be inferred"
     end
+  end
+
+  def test_up_uses_the_project_public_default
+    assert_equal true, up_state_for({})["basic_auth"]
+    assert_equal false, up_state_for({ "public" => true })["basic_auth"]
+  end
+
+  def test_up_public_and_private_options_override_the_project_default
+    assert_equal false, up_state_for({ "public" => false }, "--public")["basic_auth"]
+    assert_equal true, up_state_for({ "public" => true }, "--private")["basic_auth"]
   end
 
   def test_id_validation_accepts_dns_labels_and_rejects_everything_else
@@ -295,6 +331,18 @@ class CLITest < Minitest::Test
       out, = capture_io { @cli.send(:cmd_creds, []) }
       assert_includes out, "feature  https://aaaaaaaa.proj.example.com  dev / #{password}"
       refute_includes out, "bbbbbbbb"
+    end
+  end
+
+  def test_creds_does_not_create_a_password_for_a_public_environment
+    key = save_state(project: "proj", branch: "feature", port: 4001, identifier: "aaaaaaaa", "basic_auth" => false)
+    secrets = DevEnv::Secrets.new(@config.secret_dir)
+
+    in_project do
+      out, = capture_io { @cli.send(:cmd_creds, ["feature"]) }
+
+      assert_includes out, "proj/feature is public"
+      refute secrets.password?(key)
     end
   end
 end

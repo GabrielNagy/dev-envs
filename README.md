@@ -36,8 +36,9 @@ dev-env up dev-env-support --id pkliinp6   # a stable, recognizable hostname
 The identifier, port, URL and password stay fixed while the environment record
 exists, including across restarts and inactive periods. `down` ends that
 lifetime; bringing the same branch up later creates a new environment and may
-choose a new identifier, port, URL and password. `up --public` only disables
-basic auth; the hostname is chosen the same way.
+choose a new identifier, port, URL and password. The project's `public` setting,
+or an `up --public`/`up --private` override, only changes basic auth; the hostname
+is chosen the same way.
 
 Only one environment may exist per project and exact branch. Internally each
 environment is keyed as `<project>--<branch slug>--<port>`; the port keeps
@@ -110,6 +111,7 @@ Keys, all optional except `commands.server`:
 | Key | Purpose |
 | --- | --- |
 | `name` | Hostname component; defaults to the repository directory name |
+| `public` | Set `true` to disable basic auth by default; defaults to `false` |
 | `subdomains` | Hostnames to serve, and which sit behind basic auth |
 | `commands` | `install`, `schema`, `migrate`, `server` |
 | `process_manager` | Set to `overmind` when `commands.server` delegates to Overmind |
@@ -158,7 +160,10 @@ callers — an MCP server presenting a bearer token, a webhook receiver — want
 `"auth": false`, since a basic-auth prompt in front of it turns every request
 into a 401 the client cannot answer.
 
-`dev-env up --public` still overrides the lot and serves every hostname open.
+A top-level `"public": true` serves every hostname without basic auth by
+default. It defaults to `false`; `dev-env up --public` and `dev-env up --private`
+override the project setting for one new environment. The choice is recorded on
+`up`, so existing environments keep their current access until recreated.
 
 Caddy cannot vary basic auth between hostnames inside one site block, so guarded
 and open hostnames are routed separately. Subdomain labels are folded into the

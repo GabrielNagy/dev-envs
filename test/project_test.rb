@@ -53,6 +53,15 @@ class ProjectTest < Minitest::Test
     assert_equal ["bin/cleanup"], build_project(@config, { "after_down" => ["bin/cleanup"] }).after_down
   end
 
+  def test_public_defaults_false_and_requires_a_boolean
+    refute build_project(@config).public?
+    assert build_project(@config, { "public" => true }).public?
+    refute build_project(@config, { "public" => false }).public?
+
+    error = assert_raises(DevEnv::Error) { build_project(@config, { "public" => "yes" }).public? }
+    assert_includes error.message, "must be true or false"
+  end
+
   def test_subdomains_defaults_shorthand_and_validation
     assert_equal [{ "label" => "", "auth" => true }, { "label" => "app", "auth" => true }],
                  build_project(@config).subdomains
