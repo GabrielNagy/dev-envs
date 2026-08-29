@@ -115,6 +115,7 @@ module DevEnv
         "env" => { "RAILS_ENV" => "development" },
         "subdomains" => { "" => { "auth" => true }, "app" => { "auth" => true } },
         "after_restore" => [],
+        "after_down" => [],
         "worktree_files" => {},
       }) + "\n")
       ok "Wrote #{path} — edit it to match this project, then: dev-env up <branch>"
@@ -227,6 +228,8 @@ module DevEnv
       systemd.configure_process_manager(key, process_manager_for(state))
       step "Stopping #{systemd.unit(key)}"
       systemd.systemctl("disable", "--now", systemd.unit(key), check: false)
+
+      run_after_down(state, options)
 
       step "Removing Caddy site"
       # The wildcard certificate is per project, so removing this hostname's
@@ -426,6 +429,32 @@ module DevEnv
     def worktrees = @worktrees ||= Worktrees.new(project)
     def systemd   = @systemd   ||= Systemd.new(unit_path: @config.unit_path, env_dir: @config.state_dir, run_dir: @config.run_dir)
     def process_manager_for(state) = state.fetch("process_manager") { project.process_manager }
+
+    # Project-defined teardown, mirroring after_restore. Runs after the service
+    # stops and before anything is removed, so hooks still see the worktree,
+    # database and saved environment. dev-env only removes what it created; a
+    # project whose server pairs extra resources with an environment (a second
+    # repository's worktree, say) cleans them up here. Hook failures warn but
+    # never abort `down` — aborting halfway through teardown leaves a zombie.
+    def run_after_down(state, options)
+      hooks = project.after_down
+      return if hooks.empty?
+      vars = project.vars_for(state)
+      env = project.app_env_for(vars).merge(
+        "DEV_ENV_KEEP_WORKTREE" => (!options[:worktree]).to_s,
+        "DEV_ENV_KEEP_DATABASE" => (!options[:database]).to_s,
+      )
+      chdir = Dir.exist?(state["worktree"].to_s) ? state["worktree"] : project.root
+      hooks.each do |command|
+        step "Running after_down: #{command}"
+        sh(interpolate(command, vars), chdir: chdir, env: env, check: false) ||
+          note("after_down command failed (continuing): #{command}")
+      end
+    rescue Error => error
+      # `down` accepts a raw runtime key and may run outside the repository,
+      # where project settings are unreachable. Removal must still proceed.
+      note "Skipping after_down commands: #{error.message}"
+    end
 
     # Every recorded environment of the current project.
     def project_states

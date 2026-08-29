@@ -164,6 +164,30 @@ class CLITest < Minitest::Test
     end
   end
 
+  def test_down_runs_after_down_hooks_with_vars_and_keep_flags_and_survives_failures
+    key = save_state(project: "proj", branch: "feature", port: 4001, identifier: "aaaaaaaa")
+
+    in_project("proj", "after_down" => ["cleanup ${PORT} ${BRANCH}", "exit 1"]) do
+      @cli.send(:caddy).define_singleton_method(:reload) { nil }
+      @cli.send(:systemd).define_singleton_method(:systemctl) { |*| true }
+      @cli.send(:systemd).define_singleton_method(:configure_process_manager) { |*| nil }
+      calls = []
+      @cli.define_singleton_method(:run) do |*cmd, **kwargs|
+        calls << [cmd.join(" "), kwargs]
+        !cmd.join(" ").start_with?("exit") # the second hook fails
+      end
+
+      out, err = capture_io { @cli.send(:cmd_down, ["feature", "--keep-worktree"]) }
+
+      hook, kwargs = calls.find { |command,| command == "cleanup 4001 feature" }
+      assert hook, "expected the interpolated hook to run, got: #{calls.map(&:first)}"
+      assert_equal "true", kwargs[:env]["DEV_ENV_KEEP_WORKTREE"]
+      assert_equal "false", kwargs[:env]["DEV_ENV_KEEP_DATABASE"]
+      assert_includes err.to_s + out, "after_down command failed"
+      refute @store.exist?(key), "a failing hook must not abort down"
+    end
+  end
+
   def test_warm_rewrites_only_recorded_environments_of_the_current_project
     mine  = save_state(project: "proj", branch: "feature", port: 4001, identifier: "aaaaaaaa", "basic_auth" => false)
     other = save_state(project: "zed", branch: "other", port: 4002, identifier: "bbbbbbbb", "basic_auth" => false)

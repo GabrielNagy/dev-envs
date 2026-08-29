@@ -114,6 +114,7 @@ Keys, all optional except `commands.server`:
 | `process_manager` | Set to `overmind` when `commands.server` delegates to Overmind |
 | `env` | Environment variables for those commands and the service |
 | `after_restore` | Commands to run after a dump is restored |
+| `after_down` | Commands run by `down` after the service stops, before anything is removed |
 | `link_from_root` | Globs symlinked from the primary checkout into each worktree, for gitignored files such as credential keys |
 | `worktree_files` | Untracked files written into each worktree, optionally guarded by `unless_file_contains` |
 | `seed`, `worktree_root` | Override the defaults |
@@ -122,6 +123,14 @@ Keys, all optional except `commands.server`:
 `${BRANCH}`, `${PROJECT}`, `${WORKTREE}` and `${TLD_LENGTH}` are interpolated, as
 are `${<SUB>_DOMAIN}` and `${<SUB>_DOMAIN_RE}` for each declared subdomain — an
 `mcp` subdomain gives `${MCP_DOMAIN}` and `${MCP_DOMAIN_RE}`.
+
+`after_down` is for resources dev-env does not track — a paired worktree in a
+second repository, say. Hooks run in the environment's worktree with its saved
+variables, after the service stops and before the database, worktree and state
+are removed, so they can still inspect everything. `DEV_ENV_KEEP_WORKTREE` and
+`DEV_ENV_KEEP_DATABASE` are set to `true`/`false` reflecting `--keep-worktree`
+and `--keep-database`, so hooks can honor the same intent. A failing hook
+prints a warning and `down` continues; teardown never aborts halfway.
 
 `"process_manager": "overmind"` installs Overmind's shutdown handling only for
 that environment's systemd unit. Set it even when `commands.server` invokes a

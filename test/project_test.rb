@@ -39,6 +39,11 @@ class ProjectTest < Minitest::Test
     assert_equal "foreman", build_project(@config, { "process_manager" => "foreman" }).process_manager
   end
 
+  def test_after_down_defaults_empty_and_wraps_arrays
+    assert_equal [], build_project(@config).after_down
+    assert_equal ["bin/cleanup"], build_project(@config, { "after_down" => ["bin/cleanup"] }).after_down
+  end
+
   def test_subdomains_defaults_shorthand_and_validation
     assert_equal [{ "label" => "", "auth" => true }, { "label" => "app", "auth" => true }],
                  build_project(@config).subdomains

@@ -41,6 +41,7 @@ module DevEnv
     def commands        = @settings["commands"] || {}
     def process_manager = @settings["process_manager"]
     def after_restore   = Array(@settings["after_restore"])
+    def after_down      = Array(@settings["after_down"])
     def link_from_root  = Array(@settings["link_from_root"])
     def worktree_files  = @settings["worktree_files"] || {}
 
