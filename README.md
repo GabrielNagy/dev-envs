@@ -15,9 +15,10 @@ dev-env logs <slot> -f  # follow the log
 dev-env down <slot>     # tear down and free the slot
 ```
 
-Environments are served at `https://dev<N>.<project>.<base domain>`, plus one
-hostname per subdomain the project declares — by default `app.`, so
-`https://app.dev<N>.<project>.<base domain>`.
+Private environments are served at `https://dev<N>.<project>.<base domain>`,
+plus one hostname per subdomain the project declares — by default `app.`, so
+`https://app.dev<N>.<project>.<base domain>`. `up --public` uses a persistent
+randomized alias in place of `dev<N>` and disables basic auth.
 
 ## Setting up a machine
 
@@ -32,6 +33,11 @@ installs the `dev-env@.service` systemd user template. Enable lingering so
 environments survive logout: `loginctl enable-linger $USER`.
 
 `config.json` is machine-local and gitignored — see `config.example.json`.
+By default Caddy's automatic HTTPS obtains one certificate per exact hostname.
+Set `acme_dns_provider` (for example, `route53`) to use one wildcard certificate
+per project through DNS-01; the provider's credentials must be available to Caddy.
+Certificate mode is a setup-time choice, as is `base_domain` when using wildcards;
+tear down environments and remove their managed Caddy sites before changing either.
 
 ## Existing worktrees
 
@@ -114,11 +120,11 @@ into a 401 the client cannot answer.
 
 `dev-env up --public` still overrides the lot and serves every hostname open.
 
-Caddy cannot vary basic auth between hostnames inside one site block, so the
-guarded and open hostnames become two blocks over the same backend. Adding a
-subdomain to a project whose environments are already up takes effect on
-`dev-env warm`, which rewrites every slot's Caddy site and fetches any
-certificate the new hostname needs.
+Caddy cannot vary basic auth between hostnames inside one site block, so guarded
+and open hostnames are routed separately. With wildcard certificates, subdomain
+labels are folded into the leftmost label (`dev1-app.project.example.com`) so
+the certificate covers them. Adding a subdomain to a project whose environments
+are already up takes effect on `dev-env warm`.
 
 ## Seed data
 
@@ -128,11 +134,11 @@ environment's database from it.
 
 ## Why a fixed pool
 
-Caddy issues one certificate per hostname, and Let's Encrypt caps new
+By default Caddy issues one certificate per hostname, and Let's Encrypt caps new
 certificates per registered domain per week. Reusing a small pool of slots means
-those hostnames are issued once and thereafter only renewed, and renewals do not
-count against that cap. Freeing a slot leaves a placeholder Caddy site behind so
-renewal continues while it is idle.
+those hostnames are issued once and thereafter only renewed. A configured
+wildcard certificate covers the whole project instead. Freeing a slot leaves a
+placeholder Caddy site behind so renewal continues while it is idle.
 
 Basic-auth passwords are per slot and persist across teardown, so credentials
 saved in a browser keep working when a slot is reused.

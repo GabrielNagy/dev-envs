@@ -4,5 +4,6 @@
   "port_range": [4000, 4999],
   "pool_size": 3,
   "acme_email": "you@example.com",
+  "acme_dns_provider": "",
   "basic_auth_user": "dev"
 }

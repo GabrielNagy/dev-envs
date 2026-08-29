@@ -107,7 +107,7 @@ DEFAULT_PROJECT = {
   "seed" => nil,
 }.freeze
 
-# "" is the bare hostname; every other key becomes a label in front of it.
+# "" is the bare hostname; every other key adds a named hostname.
 DEFAULT_SUBDOMAINS = { "" => { "auth" => true }, "app" => { "auth" => true } }.freeze
 
 # Everything about a project is derived from the repository it is run in, so the
@@ -144,7 +144,41 @@ end
 
 def pool = (1..Integer(project["pool_size"])).map { |n| "dev#{n}" }
 def key_for(slot) = "#{project['name']}-#{slot}"
-def domain_for(slot) = "#{slot}.#{project['name']}.#{config['base_domain']}"
+def domain_for(slot, public: false)
+  label = public ? hostname_alias_for(key_for(slot)) : slot
+  "#{label}.#{project['name']}.#{config['base_domain']}"
+end
+
+def wildcard_certificates? = !config.fetch("acme_dns_provider", "").strip.empty?
+
+def managed_caddy_sites(pattern)
+  Dir.glob(File.join(SITES_DIR, pattern)).select do |path|
+    File.file?(path) && File.open(path, &:gets).to_s.start_with?("# Managed by dev-env")
+  end
+end
+
+def ensure_certificate_configuration!
+  wildcard_sites = managed_caddy_sites("*.wildcard.caddy")
+  exact_sites = managed_caddy_sites("*.caddy") - wildcard_sites
+  conflicting = wildcard_certificates? ? exact_sites : wildcard_sites
+  unless conflicting.empty?
+    abort!("certificate mode changed while managed Caddy sites exist. Restore the previous " \
+           "acme_dns_provider, tear down active environments, then remove the managed sites " \
+           "under #{SITES_DIR} before applying this change")
+  end
+
+  return unless wildcard_certificates?
+
+  mismatched = wildcard_sites.reject do |path|
+    name = File.basename(path).delete_suffix(".wildcard.caddy")
+    File.read(path).include?("https://*.#{name}.#{config['base_domain']} {")
+  end
+  return if mismatched.empty?
+
+  abort!("base_domain changed while wildcard Caddy sites exist. Restore the previous base_domain, " \
+         "tear down active environments, then remove the managed sites under #{SITES_DIR} before " \
+         "applying this change")
+end
 
 # The hostnames one environment answers on. A project declares them as
 # {"": {"auth": true}, "mcp": {"auth": false}}; a bare true or false is
@@ -169,7 +203,13 @@ def subdomains
   end
 end
 
-def host_for(domain, label) = label.empty? ? domain : "#{label}.#{domain}"
+def host_for(domain, label)
+  return domain if label.empty?
+  return "#{label}.#{domain}" unless wildcard_certificates?
+
+  first, rest = domain.split(".", 2)
+  "#{label}-#{first}.#{rest}"
+end
 def hosts_for(domain) = subdomains.map { |sub| host_for(domain, sub["label"]) }
 
 # Hostname interpolation vars: ${DOMAIN} for the bare hostname, plus a
@@ -194,9 +234,32 @@ end
 
 def state_path(key)  = File.join(STATE_DIR, "#{key}.json")
 def env_path(key)    = File.join(STATE_DIR, "#{key}.env")
-def site_path(key)   = File.join(SITES_DIR, "#{key}.caddy")
+def project_sites_dir       = File.join(SITES_DIR, project["name"])
+def wildcard_site_path      = File.join(SITES_DIR, "#{project['name']}.wildcard.caddy")
+def matcher_name(key, part) = "#{key.tr('-', '_')}_#{part}"
+
+def site_path(key)
+  directory = wildcard_certificates? ? project_sites_dir : SITES_DIR
+  File.join(directory, "#{key}.caddy")
+end
+
+def ensure_wildcard_site
+  return unless wildcard_certificates?
+
+  FileUtils.mkdir_p(project_sites_dir)
+  File.write(wildcard_site_path, <<~CADDY)
+    # Managed by dev-env — one wildcard site for every slot in this project.
+    https://*.#{project['name']}.#{config['base_domain']} {
+      tls {
+        dns #{config['acme_dns_provider'].strip}
+      }
+      import #{project_sites_dir}/*.caddy
+    }
+  CADDY
+end
 def run_path(key)    = File.join(RUN_DIR, "#{key}.sh")
 def secret_path(key) = File.join(SECRET_DIR, "#{key}.password")
+def alias_path(key)  = File.join(SECRET_DIR, "#{key}.hostname-alias")
 def database_for(key) = "dev_env_#{key.tr('-', '_')}"
 def unit(key) = "dev-env@#{key}.service"
 def default_dump = File.join(DUMP_DIR, project["seed"])
@@ -215,6 +278,17 @@ def password_for(key)
   path = secret_path(key)
   unless File.exist?(path)
     File.write(path, SecureRandom.alphanumeric(16))
+    File.chmod(0o600, path)
+  end
+  File.read(path).strip
+end
+
+# Public aliases persist per slot so bookmarked URLs survive reuse.
+def hostname_alias_for(key)
+  FileUtils.mkdir_p(SECRET_DIR)
+  path = alias_path(key)
+  unless File.exist?(path)
+    File.write(path, SecureRandom.alphanumeric(8).downcase)
     File.chmod(0o600, path)
   end
   File.read(path).strip
@@ -260,8 +334,11 @@ def cmd_setup(_argv)
       "port_range" => [4000, 4999],
       "pool_size" => 3,
       "acme_email" => "",
+      "acme_dns_provider" => "",
     }) + "\n")
-    ok "Wrote #{CONFIG_PATH} — set base_domain and acme_email, then re-run setup"
+    ok "Wrote #{CONFIG_PATH} — set base_domain and acme_email, then re-run setup. " \
+       "Set acme_dns_provider (e.g. \"route53\") too if projects should get a " \
+       "wildcard certificate instead of one certificate per hostname."
     return
   end
 
@@ -353,7 +430,7 @@ def cmd_up(argv)
     o.on("--slot SLOT", "Pool slot to use (#{pool.join(', ')}); default: first free") { |v| options[:slot] = v }
     o.on("--seed PATH", "Dump to restore (default: #{default_dump})") { |v| options[:seed] = v; options[:seed_given] = true }
     o.on("--no-seed", "Skip the dump; build the schema from migrations") { options[:no_seed] = true }
-    o.on("--public", "Serve without HTTP basic auth") { options[:basic_auth] = false }
+    o.on("--public", "Serve on a randomized hostname without HTTP basic auth") { options[:basic_auth] = false }
     o.on("--base REF", "Base ref when the branch does not exist (default: origin/main)") { |v| options[:base] = v }
     o.on("--worktree PATH", "Serve an existing checkout instead of creating one") { |v| options[:worktree_path] = v }
   end
@@ -363,7 +440,7 @@ def cmd_up(argv)
 
   slot = allocate_slot(options[:slot])
   key = key_for(slot)
-  domain = domain_for(slot)
+  domain = domain_for(slot, public: !options[:basic_auth])
   database = database_for(key)
   # git allows a branch in only one worktree, so a checkout that already exists is the one to
   # serve, not a conflict to refuse. An agent's worktree is the common case.
@@ -474,6 +551,13 @@ def write_worktree_files(worktree, domain)
   Array(project["link_from_root"]).each do |pattern|
     Dir.glob(File.join(project["root"], pattern)).each do |source|
       target = File.join(worktree, source.delete_prefix(project["root"] + "/"))
+      # When the worktree being served is the primary checkout itself
+      # (adopted, per "Existing worktrees" above), source and target are the
+      # same path: ln_sf would replace the real file with a symlink to
+      # itself, destroying it. Nothing to link in that case — it is already
+      # exactly where it needs to be.
+      next if File.expand_path(target) == File.expand_path(source)
+
       FileUtils.mkdir_p(File.dirname(target))
       FileUtils.ln_sf(source, target)
     end
@@ -559,6 +643,7 @@ def build_environment(key, slot, branch, database, worktree, domain, port, seed,
   step "Writing configuration"
   File.write(env_path(key), app_env.map { |k, v| "#{k}=#{v}" }.join("\n") + "\n")
   write_launcher(key, worktree, commands.fetch("server") { abort!("no commands.server in .dev-env.json") })
+  ensure_wildcard_site
   write_site(key, domain, port, password)
   File.write(state_path(key), JSON.pretty_generate({
     "key" => key, "slot" => slot, "project" => project["name"], "branch" => branch,
@@ -605,37 +690,63 @@ def write_site(key, domain, port, password)
     auth = "\n\tbasic_auth {\n\t\t#{basic_auth_user} #{hash}\n\t}"
   end
 
-  # Caddy cannot vary basic_auth between hostnames within one site block, so the
-  # guarded and open hostnames become separate blocks over the same backend.
   guarded, open = subdomains.partition { |sub| password && sub["auth"] }
   blocks = []
-  blocks << proxy_block(hosts(domain, guarded), port, auth) if guarded.any?
-  blocks << proxy_block(hosts(domain, open), port, "") if open.any?
+  if wildcard_certificates?
+    blocks << handle_block(matcher_name(key, "guarded"), hosts(domain, guarded), port, auth) if guarded.any?
+    blocks << handle_block(matcher_name(key, "open"), hosts(domain, open), port, "") if open.any?
+  else
+    blocks << proxy_block(hosts(domain, guarded), port, auth) if guarded.any?
+    blocks << proxy_block(hosts(domain, open), port, "") if open.any?
+  end
 
+  FileUtils.mkdir_p(File.dirname(site_path(key)))
   File.write(site_path(key), <<~HEADER + blocks.join("\n"))
     # Managed by dev-env — regenerated on `up`, parked on `down`.
   HEADER
 end
 
-def hosts(domain, subs) = subs.map { |sub| host_for(domain, sub["label"]) }.join(", ")
+def hosts(domain, subs) = subs.map { |sub| host_for(domain, sub["label"]) }
 
 def proxy_block(hosts, port, auth)
   <<~SITE
-    #{hosts} {
+    #{hosts.join(', ')} {
+      reverse_proxy 127.0.0.1:#{port}#{auth}
+    }
+  SITE
+end
+
+def handle_block(matcher, hosts, port, auth)
+  <<~SITE
+    @#{matcher} host #{hosts.join(" ")}
+    handle @#{matcher} {
     	reverse_proxy 127.0.0.1:#{port}#{auth}
     }
   SITE
 end
 
-def write_parking_site(key, slot)
-  domain = domain_for(slot)
-  File.write(site_path(key), <<~SITE)
+def write_parking_site(key, slot, domain = domain_for(slot))
+  body = if wildcard_certificates?
+    matcher = matcher_name(key, "parked")
+    <<~SITE
+      @#{matcher} host #{hosts_for(domain).join(" ")}
+      handle @#{matcher} {
+        respond "#{project['name']}/#{slot} is free — claim it with: dev-env up <branch> --slot #{slot}" 200
+      }
+    SITE
+  else
+    <<~SITE
+      #{hosts_for(domain).join(', ')} {
+        respond "#{project['name']}/#{slot} is free — claim it with: dev-env up <branch> --slot #{slot}" 200
+      }
+    SITE
+  end
+
+  FileUtils.mkdir_p(File.dirname(site_path(key)))
+  File.write(site_path(key), <<~HEADER + body)
     # Managed by dev-env — placeholder so this slot's certificates stay renewed
     # while it is free. Replaced when an environment claims the slot.
-    #{hosts_for(domain).join(', ')} {
-    	respond "#{project['name']}/#{slot} is free — claim it with: dev-env up <branch> --slot #{slot}" 200
-    }
-  SITE
+  HEADER
 end
 
 def wait_for_boot(port, timeout: 90)
@@ -696,7 +807,7 @@ def cmd_down(argv)
   step "Parking Caddy site"
   # A placeholder rather than a deletion, so Caddy keeps renewing this slot's
   # certificates and the next `up` needs no fresh issuance.
-  write_parking_site(key, state["slot"])
+  write_parking_site(key, state["slot"], state["domain"])
   caddy_reload
 
   if options[:database]
@@ -769,14 +880,15 @@ def cmd_creds(argv)
       key = key_for(slot)
       next unless File.exist?(secret_path(key))
       status = File.exist?(state_path(key)) ? "" : "  \e[90m(slot free)\e[0m"
-      host = host_for(domain_for(slot), guarded.first["label"])
+      domain = File.exist?(state_path(key)) ? load_state(key)["domain"] : domain_for(slot)
+      host = host_for(domain, guarded.first["label"])
       puts "#{slot}  https://#{host}  #{basic_auth_user} / #{password_for(key)}#{status}"
     end
     return
   end
 
   key = key_for(argv.shift)
-  domain = domain_for(load_state(key)["slot"])
+  domain = load_state(key)["domain"]
   guarded.each_with_index do |sub, index|
     puts "#{index.zero? ? 'URLs' : ''.ljust(4)}     https://#{host_for(domain, sub['label'])}"
   end
@@ -835,6 +947,7 @@ def cmd_seed(argv)
 end
 
 def cmd_warm(_argv)
+  ensure_wildcard_site
   # Every slot's site file is rewritten, not just the free ones': a subdomain
   # added to .dev-env.json after an environment came up would otherwise go
   # unserved until that slot's next `up`.
@@ -853,7 +966,9 @@ def cmd_warm(_argv)
   # triggers issuance fails its own handshake, so retry until one succeeds.
   failed = []
   pool.each do |slot|
-    hosts_for(domain_for(slot)).each do |host|
+    key = key_for(slot)
+    domain = File.exist?(state_path(key)) ? load_state(key)["domain"] : domain_for(slot)
+    hosts_for(domain).each do |host|
       code = nil
       3.times do
         code = capture("curl", "-s", "-o", "/dev/null", "-w", "%{http_code}", "--max-time", "45", "https://#{host}")
@@ -887,11 +1002,16 @@ USAGE = <<~TEXT
     warm              Rewrite every slot's Caddy site and pre-issue certificates
 
   Environments occupy a fixed per-project pool, served at
-  https://<subdomain>.<slot>.<project>.<base domain>, with the subdomains and
-  which of them sit behind basic auth declared in .dev-env.json
+  per-slot HTTPS hostnames, with the subdomains and which of them sit behind
+  basic auth declared in .dev-env.json
 TEXT
 
-case (command = ARGV.shift)
+command = ARGV.shift
+if File.exist?(CONFIG_PATH) && %w[setup up down creds seed warm].include?(command)
+  ensure_certificate_configuration!
+end
+
+case command
 when "setup"   then cmd_setup(ARGV)
 when "init"    then cmd_init(ARGV)
 when "up"      then cmd_up(ARGV)
