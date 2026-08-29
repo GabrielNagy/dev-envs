@@ -15,24 +15,26 @@ module DevEnv
         setup             Detect the public address, write the Caddy config and unit
       Per project (run inside its repository):
         init              Write a starter .dev-env.json
-        up <branch>       Claim a free slot: worktree, database and service
-        down <slot>       Tear an environment down and free its slot
-        list              Show every environment, and this project's free slots
-        creds [slot]      Show the basic-auth credentials
-        logs [slot] [-f]  Follow the log
-        restart [slot]    Restart the service
-        exec [slot] -c "command"
+        up <branch>       Create an environment: worktree, database and service
+        down <branch>     Tear an environment down
+        list              Show every environment
+        creds [branch]    Show the basic-auth credentials
+        logs [branch] [-f]
+                          Follow the log
+        restart [branch]  Restart the service
+        exec [branch] -c "command"
                           Run a command in the environment's worktree and env
-        activate [slot]   Open a shell in the environment's worktree and env; exit to leave
-        seed [slot]       Rebuild the database from the seed dump
-        warm              Rewrite every slot's Caddy site and pre-issue certificates
+        activate [branch] Open a shell in the environment's worktree and env; exit to leave
+        seed [branch]     Rebuild the database from the seed dump
+        warm              Rewrite recorded Caddy sites and pre-issue certificates
 
-      Run from inside an environment's worktree, commands taking [slot] default
-      to that environment when the slot is omitted.
+      Run from inside an environment's worktree, commands taking [branch] default
+      to that environment when the branch is omitted.
 
-      Environments occupy a fixed per-project pool, served at
-      per-slot HTTPS hostnames, with the subdomains and which of them sit behind
-      basic auth declared in .dev-env.json
+      Environments are created on demand, each served at an HTTPS hostname whose
+      leftmost label is a random identifier (or one chosen with `up --id`), with
+      the subdomains and which of them sit behind basic auth declared in
+      .dev-env.json
     TEXT
 
     def initialize(config: Config.new)
@@ -70,16 +72,17 @@ module DevEnv
           "base_domain" => "example.com",
           "bind_ip" => ip,
           "port_range" => [4000, 4999],
-          "pool_size" => 3,
           "acme_email" => "",
           "acme_dns_provider" => "",
         }) + "\n")
-        ok "Wrote #{@config.path} — set base_domain and acme_email, then re-run setup. " \
-           "Set acme_dns_provider (e.g. \"route53\") too if projects should get a " \
-           "wildcard certificate instead of one certificate per hostname."
+        ok "Wrote #{@config.path} — set base_domain, acme_email and acme_dns_provider " \
+           "(e.g. \"route53\"), then re-run setup. Each project is served under one " \
+           "wildcard certificate, so a DNS-01 provider is required and its credentials " \
+           "must be available to Caddy."
         return
       end
 
+      @config.acme_dns_provider # required; fail here rather than on the first `up`
       if @config["bind_ip"] != ip
         note "config bind_ip is #{@config['bind_ip'].inspect} but this box answers on #{ip}"
       end
@@ -123,10 +126,10 @@ module DevEnv
       options = { basic_auth: true, base: "origin/main" }
       parser = OptionParser.new do |o|
         o.banner = "Usage: dev-env up <branch> [options]"
-        o.on("--slot SLOT", "Pool slot to use (#{project.pool.join(', ')}); default: first free") { |v| options[:slot] = v }
+        o.on("--id ID", "Hostname identifier: a lowercase DNS label of at most 8 characters (default: random)") { |v| options[:id] = v }
         o.on("--seed PATH", "Dump to restore (default: #{project.default_dump})") { |v| options[:seed] = v; options[:seed_given] = true }
         o.on("--no-seed", "Skip the dump; build the schema from migrations") { options[:no_seed] = true }
-        o.on("--public", "Serve on a randomized hostname without HTTP basic auth") { options[:basic_auth] = false }
+        o.on("--public", "Serve without HTTP basic auth") { options[:basic_auth] = false }
         o.on("--base REF", "Base ref when the branch does not exist (default: origin/main)") { |v| options[:base] = v }
         o.on("--worktree PATH", "Serve an existing checkout instead of creating one") { |v| options[:worktree_path] = v }
       end
@@ -134,59 +137,75 @@ module DevEnv
       branch = argv.shift
       raise Error, parser.banner if branch.nil?
 
-      slot = allocate_slot(options[:slot])
-      key = project.key_for(slot)
-      database = project.database_for(key)
-      # git allows a branch in only one worktree, so a checkout that already exists is the one to
-      # serve, not a conflict to refuse. An agent's worktree is the common case.
-      worktree = File.expand_path(options[:worktree_path] || worktrees.existing_for(branch) ||
-                                  File.join(project.worktree_root, slugify(branch)))
-      worktrees.verify_adopted!(worktree, branch) if Dir.exist?(worktree)
-      seed = options[:no_seed] ? nil : (options[:seed] || project.default_dump)
+      # The exact (project, branch) pair is the logical identity; only one
+      # recorded environment may exist for it.
+      if (existing = project_states.find { |state| state["branch"] == branch })
+        raise Error, "#{project.name} already has an environment for #{branch.inspect} " \
+                     "(https://#{existing['domain']}) — tear it down first: dev-env down #{branch}"
+      end
+      identifier = options[:id] ? validate_identifier!(options[:id]) : generate_identifier
 
-      state = {
-        "key" => key, "slot" => slot, "project" => project.name, "branch" => branch,
-        "domain" => project.domain_for(options[:basic_auth] ? slot : secrets.hostname_alias_for(key)),
-        "port" => @config.free_port(reserved: store.keys.map { |k| store.load(k)["port"] }),
-        "database" => database, "worktree" => worktree,
-        # Only a worktree this command created may be torn down by it, on rollback or on `down`.
-        "worktree_owned" => !Dir.exist?(worktree),
-        "basic_auth" => options[:basic_auth] && project.subdomains.any? { |sub| sub["auth"] },
-        "process_manager" => project.process_manager,
-        "created_at" => Time.now.utc.iso8601,
-      }
-
-      FileUtils.mkdir_p([@config.state_dir, @config.run_dir, project.worktree_root])
-      systemd.install unless systemd.installed?
-
-      # A half-built environment is worse than none: undo whatever was created
-      # if a later step fails, so the slot is free to retry.
-      rollback = []
+      # Hold the port's socket open while the environment is prepared, so no
+      # other process can claim it during a long build. Released immediately
+      # before the service that binds it starts.
+      reservation = @config.reserve_port(reserved: store.keys.map { |k| store.load(k)["port"] })
       begin
-        if state["worktree_owned"]
-          step "Creating worktree #{worktree} for #{branch}"
-          worktrees.create(worktree, branch, options[:base])
-          rollback << -> { worktrees.remove(worktree, quiet: true) }
-        else
-          step "Using existing worktree #{worktree} for #{branch}"
-        end
-        worktrees.write_files(worktree, state["domain"])
+        port = reservation.addr[1]
+        key = project.key_for(branch, port)
+        database = project.database_for(port, identifier)
+        # git allows a branch in only one worktree, so a checkout that already exists is the one to
+        # serve, not a conflict to refuse. An agent's worktree is the common case.
+        worktree = File.expand_path(options[:worktree_path] || worktrees.existing_for(branch) ||
+                                    File.join(project.worktree_root, "#{slugify(branch)}--#{port}"))
+        worktrees.verify_adopted!(worktree, branch) if Dir.exist?(worktree)
+        seed = options[:no_seed] ? nil : (options[:seed] || project.default_dump)
 
-        step "Creating database #{database}"
-        if capture("psql", "-tAc", "SELECT 1 FROM pg_database WHERE datname = '#{database}'") == "1"
-          raise Error, "database #{database} already exists"
-        end
-        run("createdb", database)
-        rollback << -> { run("dropdb", "--if-exists", database, check: false, quiet: true) }
+        state = {
+          "key" => key, "project" => project.name, "branch" => branch,
+          "identifier" => identifier, "domain" => project.domain_for(identifier),
+          "port" => port, "database" => database, "worktree" => worktree,
+          # Only a worktree this command created may be torn down by it, on rollback or on `down`.
+          "worktree_owned" => !Dir.exist?(worktree),
+          "basic_auth" => options[:basic_auth] && project.subdomains.any? { |sub| sub["auth"] },
+          "process_manager" => project.process_manager,
+          "created_at" => Time.now.utc.iso8601,
+        }
 
-        build_environment(state, seed, options)
-      rescue StandardError => error
-        note "Failed partway through — rolling back"
-        rollback.reverse_each { |undo| undo.call rescue nil }
-        systemd.configure_process_manager(key, nil)
-        store.delete(key)
-        caddy.delete_site(key)
-        raise error
+        FileUtils.mkdir_p([@config.state_dir, @config.run_dir, project.worktree_root])
+        systemd.install unless systemd.installed?
+
+        # A half-built environment is worse than none: undo whatever was
+        # created if a later step fails, so a retry starts clean.
+        rollback = []
+        begin
+          if state["worktree_owned"]
+            step "Creating worktree #{worktree} for #{branch}"
+            worktrees.create(worktree, branch, options[:base])
+            rollback << -> { worktrees.remove(worktree, quiet: true) }
+          else
+            step "Using existing worktree #{worktree} for #{branch}"
+          end
+          worktrees.write_files(worktree, state["domain"])
+
+          step "Creating database #{database}"
+          if capture("psql", "-tAc", "SELECT 1 FROM pg_database WHERE datname = '#{database}'") == "1"
+            raise Error, "database #{database} already exists"
+          end
+          run("createdb", database)
+          rollback << -> { run("dropdb", "--if-exists", database, check: false, quiet: true) }
+
+          build_environment(state, seed, options, reservation)
+        rescue StandardError => error
+          note "Failed partway through — rolling back"
+          rollback.reverse_each { |undo| undo.call rescue nil }
+          systemd.configure_process_manager(key, nil)
+          secrets.delete_password(key)
+          store.delete(key)
+          caddy.delete_site(key)
+          raise error
+        end
+      ensure
+        reservation.close unless reservation.closed?
       end
     end
 
@@ -195,7 +214,7 @@ module DevEnv
     def cmd_down(argv)
       options = { worktree: true, database: true }
       parser = OptionParser.new do |o|
-        o.banner = "Usage: dev-env down <slot> [options]"
+        o.banner = "Usage: dev-env down <branch> [options]"
         o.on("--keep-worktree", "Leave the git worktree in place") { options[:worktree] = false }
         o.on("--remove-worktree", "Remove a worktree whose origin predates ownership tracking") { options[:force_worktree] = true }
         o.on("--keep-database", "Leave the postgres database in place") { options[:database] = false }
@@ -209,10 +228,10 @@ module DevEnv
       step "Stopping #{systemd.unit(key)}"
       systemd.systemctl("disable", "--now", systemd.unit(key), check: false)
 
-      step "Parking Caddy site"
-      # A placeholder rather than a deletion, so Caddy keeps renewing this
-      # slot's certificates and the next `up` needs no fresh issuance.
-      caddy.write_parking_site(key, state["slot"], state["domain"])
+      step "Removing Caddy site"
+      # The wildcard certificate is per project, so removing this hostname's
+      # route costs nothing at the next `up`.
+      caddy.delete_site(key)
       caddy.reload
 
       if options[:database]
@@ -240,9 +259,10 @@ module DevEnv
              "an adopted checkout. Remove it yourself, or re-run with --remove-worktree."
       end
 
+      secrets.delete_password(key)
       systemd.configure_process_manager(key, nil)
       store.delete(key)
-      ok "#{state['project']}/#{state['slot']} removed (password kept for reuse)"
+      ok "#{state['project']}/#{state['branch']} removed"
     end
 
     def cmd_list(_argv)
@@ -251,38 +271,30 @@ module DevEnv
 
       rows = keys.map do |key|
         state = store.load(key)
-        [state["project"].to_s, state["slot"].to_s, state["branch"].to_s,
+        [state["project"].to_s, state["branch"].to_s,
          state["port"].to_s, systemd.status(key), "https://#{state['domain']}"]
       end
-      headers = %w[PROJECT SLOT BRANCH PORT STATUS URL]
+      headers = %w[PROJECT BRANCH PORT STATUS URL]
       widths = headers.each_with_index.map { |h, i| ([h] + rows.map { |r| r[i] }).map(&:length).max }
 
       puts headers.each_with_index.map { |h, i| h.ljust(widths[i]) }.join("  ")
       rows.each do |row|
         cells = row.each_with_index.map { |c, i| c.ljust(widths[i]) }
-        cells[4] = "#{row[4] == 'active' ? "\e[32m" : "\e[31m"}#{cells[4]}\e[0m"
+        cells[3] = "#{row[3] == 'active' ? "\e[32m" : "\e[31m"}#{cells[3]}\e[0m"
         puts cells.join("  ")
       end
-
-      free = project.pool.reject { |slot| keys.include?(project.key_for(slot)) }
-      puts "\nFree #{project.name} slots: #{free.empty? ? '(none)' : free.join(', ')}"
-    rescue Error
-      # `list` is useful outside a project directory too; the summary line is not.
     end
 
     def cmd_creds(argv)
       guarded = project.subdomains.select { |sub| sub["auth"] }
       return puts("No hostname for #{project.name} is behind basic auth.") if guarded.empty?
 
-      key = argv.empty? ? implicit_key : project.key_for(argv.shift)
+      key = argv.empty? ? implicit_key : resolve(argv.shift)
       if key.nil?
-        project.pool.each do |slot|
-          slot_key = project.key_for(slot)
-          next unless secrets.password?(slot_key)
-          status = store.exist?(slot_key) ? "" : "  \e[90m(slot free)\e[0m"
-          domain = store.exist?(slot_key) ? store.load(slot_key)["domain"] : project.domain_for(slot)
-          host = project.host_for(domain, guarded.first["label"])
-          puts "#{slot}  https://#{host}  #{@config.basic_auth_user} / #{secrets.password_for(slot_key)}#{status}"
+        project_states.each do |state|
+          next unless secrets.password?(state["key"])
+          host = project.host_for(state["domain"], guarded.first["label"])
+          puts "#{state['branch']}  https://#{host}  #{@config.basic_auth_user} / #{secrets.password_for(state['key'])}"
         end
         return
       end
@@ -296,12 +308,12 @@ module DevEnv
     end
 
     def cmd_logs(argv)
-      key = resolve_target(argv, "Usage: dev-env logs [slot] [-f]")
+      key = resolve_target(argv, "Usage: dev-env logs [branch] [-f]")
       exec("journalctl", "--user", "-u", systemd.unit(key), *argv)
     end
 
     def cmd_restart(argv)
-      key = resolve_target(argv, "Usage: dev-env restart [slot]")
+      key = resolve_target(argv, "Usage: dev-env restart [branch]")
       state = store.load(key)
       systemd.configure_process_manager(key, process_manager_for(state))
       systemd.systemctl("restart", systemd.unit(key))
@@ -311,7 +323,7 @@ module DevEnv
     def cmd_exec(argv)
       command = nil
       parser = OptionParser.new do |o|
-        o.banner = "Usage: dev-env exec [slot] -c \"command\""
+        o.banner = "Usage: dev-env exec [branch] -c \"command\""
         o.on("-c COMMAND", "Command to run in the environment") { |v| command = v }
       end
       parser.parse!(argv)
@@ -328,7 +340,7 @@ module DevEnv
     # units with a minimal PATH, and an interactive shell already has a
     # better one.
     def cmd_activate(argv)
-      key = resolve_target(argv, "Usage: dev-env activate [slot]")
+      key = resolve_target(argv, "Usage: dev-env activate [branch]")
       if nested_in_active_shell?
         # A child process cannot make its parent shell exit, so a shell
         # started here could only nest inside the active one. Refuse instead.
@@ -345,7 +357,7 @@ module DevEnv
     def cmd_seed(argv)
       options = {}
       parser = OptionParser.new do |o|
-        o.banner = "Usage: dev-env seed [slot] [--seed PATH]"
+        o.banner = "Usage: dev-env seed [branch] [--seed PATH]"
         o.on("--seed PATH", "Dump to restore (default: #{project.default_dump})") { |v| options[:seed] = v }
       end
       parser.parse!(argv)
@@ -374,27 +386,22 @@ module DevEnv
 
     def cmd_warm(_argv)
       caddy.ensure_wildcard_site
-      # Every slot's site file is rewritten, not just the free ones': a
-      # subdomain added to .dev-env.json after an environment came up would
-      # otherwise go unserved until that slot's next `up`.
-      project.pool.each do |slot|
-        key = project.key_for(slot)
-        unless store.exist?(key)
-          caddy.write_parking_site(key, slot)
-          next
-        end
-        state = store.load(key)
-        caddy.write_site(key, state["domain"], state["port"], state["basic_auth"] ? secrets.password_for(key) : nil)
+      # Every recorded environment's site file is rewritten, not just new
+      # ones': a subdomain added to .dev-env.json after an environment came up
+      # would otherwise go unserved until its next `up`.
+      states = project_states
+      states.each do |state|
+        caddy.write_site(state["key"], state["domain"], state["port"],
+                         state["basic_auth"] ? secrets.password_for(state["key"]) : nil)
       end
       caddy.reload
 
-      # Certificates are fetched lazily on first request, and the request that
-      # triggers issuance fails its own handshake, so retry until one succeeds.
+      # The wildcard certificate is fetched lazily on first request, and the
+      # request that triggers issuance fails its own handshake, so retry until
+      # one succeeds.
       failed = []
-      project.pool.each do |slot|
-        key = project.key_for(slot)
-        domain = store.exist?(key) ? store.load(key)["domain"] : project.domain_for(slot)
-        project.hosts_for(domain).each do |host|
+      states.each do |state|
+        project.hosts_for(state["domain"]).each do |host|
           code = nil
           3.times do
             code = capture("curl", "-s", "-o", "/dev/null", "-w", "%{http_code}", "--max-time", "45", "https://#{host}")
@@ -420,29 +427,41 @@ module DevEnv
     def systemd   = @systemd   ||= Systemd.new(unit_path: @config.unit_path, env_dir: @config.state_dir, run_dir: @config.run_dir)
     def process_manager_for(state) = state.fetch("process_manager") { project.process_manager }
 
-    # A fixed pool bounds certificate issuance: each slot's hostnames are
-    # issued once and thereafter only renewed, and renewals do not count
-    # against Let's Encrypt's weekly limit for new certificates.
-    def allocate_slot(requested)
-      if requested
-        raise Error, "#{requested.inspect} is not a pool slot (#{project.pool.join(', ')})" unless project.pool.include?(requested)
-        if store.exist?(project.key_for(requested))
-          raise Error, "slot #{requested} is in use by #{store.load(project.key_for(requested))['branch']}"
-        end
-        return requested
-      end
-
-      free = project.pool.find { |slot| !store.exist?(project.key_for(slot)) }
-      return free if free
-
-      in_use = project.pool.map { |slot| "  #{slot} → #{store.load(project.key_for(slot))['branch']}" }.join("\n")
-      raise Error, "all #{project.pool.length} slots for #{project.name} are in use:\n#{in_use}\n\n" \
-                   "Free one with: dev-env down <slot>"
+    # Every recorded environment of the current project.
+    def project_states
+      store.keys.map { |key| store.load(key) }.select { |state| state["project"] == project.name }
     end
 
-    def build_environment(state, seed, options)
-      key, slot, worktree, domain, port, database =
-        state.values_at("key", "slot", "worktree", "domain", "port", "database")
+    # A lowercase DNS label of at most eight characters: it becomes the
+    # leftmost public hostname label and part of the database name.
+    IDENTIFIER = /\A[a-z0-9](?:[a-z0-9-]{0,6}[a-z0-9])?\z/
+
+    def taken_identifiers = project_states.to_h { |state| [state["identifier"], state["branch"]] }
+
+    def validate_identifier!(id)
+      unless id.match?(IDENTIFIER)
+        raise Error, "#{id.inspect} is not a usable identifier — need a lowercase DNS label " \
+                     "of at most 8 characters"
+      end
+      if (branch = taken_identifiers[id])
+        raise Error, "identifier #{id.inspect} is already used by #{project.name}/#{branch}"
+      end
+      id
+    end
+
+    def generate_identifier
+      taken = taken_identifiers
+      loop do
+        id = random_identifier
+        return id unless taken.key?(id)
+      end
+    end
+
+    def random_identifier = SecureRandom.alphanumeric(8).downcase
+
+    def build_environment(state, seed, options, reservation)
+      key, branch, worktree, domain, port, database =
+        state.values_at("key", "branch", "worktree", "domain", "port", "database")
       vars = project.vars_for(state)
       app_env = project.app_env_for(vars)
       commands = interpolate(project.commands, vars)
@@ -478,11 +497,15 @@ module DevEnv
       step "Reloading Caddy"
       caddy.reload
 
+      # State is persisted, so no other `up` can pick this port from it; only
+      # now may the socket be released for the service to bind.
+      reservation.close
+
       step "Starting #{systemd.unit(key)}"
       systemd.systemctl("enable", "--now", systemd.unit(key))
 
-      note "Not answering on 127.0.0.1:#{port} yet — check: dev-env logs #{slot} -f" unless wait_for_boot(port)
-      ok "#{project.name}/#{slot} is up"
+      note "Not answering on 127.0.0.1:#{port} yet — check: dev-env logs #{branch} -f" unless wait_for_boot(port)
+      ok "#{project.name}/#{branch} is up"
       print_summary(key)
     end
 
@@ -525,20 +548,23 @@ module DevEnv
       puts "  Worktree   #{state['worktree']}#{state['worktree_owned'] ? '' : ' (adopted; kept on down)'}"
       puts "  Database   #{state['database']}  (port #{state['port']})"
       puts
-      puts "  Logs       dev-env logs #{state['slot']} -f"
-      puts "  Tear down  dev-env down #{state['slot']}"
+      puts "  Logs       dev-env logs #{state['branch']} -f"
+      puts "  Tear down  dev-env down #{state['branch']}"
       puts
     end
 
-    def resolve(slot_or_key)
-      return slot_or_key if store.exist?(slot_or_key)
-      key = project.key_for(slot_or_key)
-      return key if store.exist?(key)
-      raise Error, "no environment #{slot_or_key.inspect} for #{project.name} (try: dev-env list)"
+    # A branch names an environment by the exact `branch` recorded in state,
+    # never by reconstructing a filename from a lossy branch slug. A runtime
+    # key (from DEV_ENV_ACTIVE, say) is accepted as-is.
+    def resolve(branch_or_key)
+      return branch_or_key if store.exist?(branch_or_key)
+      match = project_states.find { |state| state["branch"] == branch_or_key }
+      return match["key"] if match
+      raise Error, "no environment #{branch_or_key.inspect} for #{project.name} (try: dev-env list)"
     end
 
     # The environment whose worktree contains the current directory, so a
-    # command run from inside a served checkout can leave the slot off. A
+    # command run from inside a served checkout can leave the branch off. A
     # shell entered with `dev-env activate` counts too, even after cd'ing
     # elsewhere.
     def implicit_key
@@ -554,12 +580,12 @@ module DevEnv
       active unless active.empty? || !store.exist?(active)
     end
 
-    # The explicit slot argument when given, otherwise the environment
+    # The explicit branch argument when given, otherwise the environment
     # inferred from the current directory. Option-like arguments (`logs -f`)
     # are left alone.
     def resolve_target(argv, usage)
       return resolve(argv.shift) if argv.first && !argv.first.start_with?("-")
-      implicit_key || raise(Error, "#{usage}\n  no slot given, and #{Dir.pwd} is not inside an environment's worktree")
+      implicit_key || raise(Error, "#{usage}\n  no branch given, and #{Dir.pwd} is not inside an environment's worktree")
     end
 
     # True when this command was run inside an activated shell, as opposed to

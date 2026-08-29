@@ -14,8 +14,8 @@ module DevEnvTest
     @tmp_dirs += [home, sites]
     settings = {
       "base_domain" => "example.com", "bind_ip" => "127.0.0.1",
-      "port_range" => [41_000, 41_010], "pool_size" => 2,
-      "acme_email" => "x@example.com", "acme_dns_provider" => "",
+      "port_range" => [41_000, 41_010],
+      "acme_email" => "x@example.com", "acme_dns_provider" => "route53",
     }.merge(extra)
     File.write(File.join(home, "config.json"), JSON.generate(settings))
     DevEnv::Config.new(home: home, sites_dir: sites, caddyfile: File.join(sites, "Caddyfile"))

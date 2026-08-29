@@ -2,8 +2,7 @@
   "base_domain": "example.com",
   "bind_ip": "203.0.113.10",
   "port_range": [4000, 4999],
-  "pool_size": 3,
   "acme_email": "you@example.com",
-  "acme_dns_provider": "",
+  "acme_dns_provider": "route53",
   "basic_auth_user": "dev"
 }

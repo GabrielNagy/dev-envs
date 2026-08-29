@@ -44,14 +44,14 @@ class WorktreesTest < Minitest::Test
     File.write(File.join(@repo, ".env.key"), "sekret")
     create_worktree
 
-    capture_io { @worktrees.write_files(@path, "dev1.proj.example.com") }
+    capture_io { @worktrees.write_files(@path, "pkliinp6.proj.example.com") }
 
     assert_equal File.join(@repo, ".env.key"), File.readlink(File.join(@path, ".env.key"))
-    assert_equal "domain 'dev1.proj.example.com'\n", File.read(File.join(@path, "config/local.rb"))
+    assert_equal "domain 'pkliinp6.proj.example.com'\n", File.read(File.join(@path, "config/local.rb"))
     assert_includes File.read(File.join(@repo, ".git", "info", "exclude")), "config/local.rb"
 
     # Writing into the primary checkout itself must not clobber the real file.
-    capture_io { @worktrees.write_files(@repo, "dev1.proj.example.com") }
+    capture_io { @worktrees.write_files(@repo, "pkliinp6.proj.example.com") }
     refute File.symlink?(File.join(@repo, ".env.key"))
     assert_equal "sekret", File.read(File.join(@repo, ".env.key"))
   end

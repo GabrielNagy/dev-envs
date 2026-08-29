@@ -14,18 +14,29 @@ class ConfigTest < Minitest::Test
     config = build_config
     assert_equal "example.com", config.base_domain
     assert_equal "dev", config.basic_auth_user
-    assert_equal 2, config.pool_size
-    refute config.wildcard_certificates?
-    assert build_config("acme_dns_provider" => "route53").wildcard_certificates?
+    assert_equal "route53", config.acme_dns_provider
     assert_equal File.join(config.home, "envs"), config.state_dir
   end
 
-  def test_free_port_skips_reserved_and_bound_ports
+  def test_acme_dns_provider_is_required
+    error = assert_raises(DevEnv::Error) { build_config("acme_dns_provider" => "").acme_dns_provider }
+    assert_includes error.message, "acme_dns_provider"
+    assert_raises(DevEnv::Error) { build_config("acme_dns_provider" => "  ").acme_dns_provider }
+  end
+
+  def test_reserve_port_returns_an_open_socket_and_skips_reserved_and_bound_ports
     config = build_config("port_range" => [41_000, 41_002])
-    server = TCPServer.new("127.0.0.1", 41_000)
-    assert_equal 41_002, config.free_port(reserved: [41_001])
-    assert_raises(DevEnv::Error) { config.free_port(reserved: [41_001, 41_002]) }
+    bound = TCPServer.new("127.0.0.1", 41_000)
+
+    reservation = config.reserve_port(reserved: [41_001])
+    assert_equal 41_002, reservation.addr[1]
+    # The reservation itself holds the port until closed.
+    assert_raises(Errno::EADDRINUSE) { TCPServer.new("127.0.0.1", 41_002) }
+    assert_raises(DevEnv::Error) { config.reserve_port(reserved: [41_001]) }
+
+    reservation.close
+    config.reserve_port(reserved: [41_001]).close
   ensure
-    server&.close
+    bound&.close
   end
 end

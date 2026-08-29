@@ -3,27 +3,45 @@
 Run a project's branches on a box and browse them over HTTPS, so a change can be
 clicked through in a real browser rather than only asserted about in tests.
 
-An environment is one slot in a per-project pool, bundling a git worktree, a
+An environment is created on demand for one branch, bundling a git worktree, a
 postgres database, a loopback port and a systemd user unit. Caddy terminates TLS
-in front and fetches a Let's Encrypt certificate per hostname.
+in front through one wildcard certificate per project.
 
 ```
-dev-env up <branch>     # claim a free slot
-dev-env list            # what is running, and which slots are free
-dev-env creds [slot]    # basic-auth credentials
-dev-env logs [slot] -f  # follow the log
-dev-env exec [slot] -c "bin/rails db:migrate:status"  # run one command in its context
-dev-env activate [slot]   # open a shell in its worktree + env; exit to leave
-dev-env down <slot>     # tear down and free the slot
+dev-env up <branch>     # create an environment
+dev-env list            # what is recorded, and where it answers
+dev-env creds [branch]  # basic-auth credentials
+dev-env logs [branch] -f  # follow the log
+dev-env exec [branch] -c "bin/rails db:migrate:status"  # run one command in its context
+dev-env activate [branch]  # open a shell in its worktree + env; exit to leave
+dev-env down <branch>   # tear the environment down
 ```
 
-Run from inside an environment's worktree, every command taking `[slot]`
+Run from inside an environment's worktree, every command taking `[branch]`
 infers it from the current directory, so the argument can be omitted.
 
-Private environments are served at `https://dev<N>.<project>.<base domain>`,
-plus one hostname per subdomain the project declares — by default `app.`, so
-`https://app.dev<N>.<project>.<base domain>`. `up --public` uses a persistent
-randomized alias in place of `dev<N>` and disables basic auth.
+Environments are served at `https://<identifier>.<project>.<base domain>`,
+plus one hostname per subdomain the project declares — by default `app`, folded
+into the leftmost label as `https://app-<identifier>.<project>.<base domain>`.
+The identifier is a random eight-character label, or one chosen with
+`up --id <label>` (a lowercase DNS label of at most eight characters, rejected
+if invalid or already used by another environment of the same project):
+
+```sh
+dev-env up dev-env-support                 # e.g. https://pkliinp6.sample.example.com
+dev-env up dev-env-support --id pkliinp6   # a stable, recognizable hostname
+```
+
+The identifier, port, URL and password stay fixed while the environment record
+exists, including across restarts and inactive periods. `down` ends that
+lifetime; bringing the same branch up later creates a new environment and may
+choose a new identifier, port, URL and password. `up --public` only disables
+basic auth; the hostname is chosen the same way.
+
+Only one environment may exist per project and exact branch. Internally each
+environment is keyed as `<project>--<branch slug>--<port>`; the port keeps
+branches whose slugs collide (`feature/foo`, `feature-foo`) distinct, and names
+the systemd unit, state files, Caddy route and database unambiguously.
 
 ## Setting up a machine
 
@@ -38,11 +56,12 @@ installs the `dev-env@.service` systemd user template. Enable lingering so
 environments survive logout: `loginctl enable-linger $USER`.
 
 `config.json` is machine-local and gitignored — see `config.example.json`.
-By default Caddy's automatic HTTPS obtains one certificate per exact hostname.
-Set `acme_dns_provider` (for example, `route53`) to use one wildcard certificate
-per project through DNS-01; the provider's credentials must be available to Caddy.
-Certificate mode is a setup-time choice, as is `base_domain` when using wildcards;
-tear down environments and remove their managed Caddy sites before changing either.
+Hostname identifiers are unbounded, so one certificate per hostname would grow
+issuance without limit; each project is instead served under one wildcard
+certificate obtained through DNS-01. `acme_dns_provider` (for example,
+`route53`) is therefore required, and the provider's credentials must be
+available to Caddy. `base_domain` is a setup-time choice; tear down
+environments and remove their managed Caddy sites before changing it.
 
 ## Existing worktrees
 
@@ -97,10 +116,10 @@ Keys, all optional except `commands.server`:
 | `after_restore` | Commands to run after a dump is restored |
 | `link_from_root` | Globs symlinked from the primary checkout into each worktree, for gitignored files such as credential keys |
 | `worktree_files` | Untracked files written into each worktree, optionally guarded by `unless_file_contains` |
-| `pool_size`, `seed`, `worktree_root` | Override the defaults |
+| `seed`, `worktree_root` | Override the defaults |
 
 `${DOMAIN}`, `${DOMAIN_RE}`, `${PORT}`, `${DATABASE}`, `${DATABASE_URL}`,
-`${SLOT}`, `${PROJECT}`, `${WORKTREE}` and `${TLD_LENGTH}` are interpolated, as
+`${BRANCH}`, `${PROJECT}`, `${WORKTREE}` and `${TLD_LENGTH}` are interpolated, as
 are `${<SUB>_DOMAIN}` and `${<SUB>_DOMAIN_RE}` for each declared subdomain — an
 `mcp` subdomain gives `${MCP_DOMAIN}` and `${MCP_DOMAIN_RE}`.
 
@@ -131,27 +150,42 @@ into a 401 the client cannot answer.
 `dev-env up --public` still overrides the lot and serves every hostname open.
 
 Caddy cannot vary basic auth between hostnames inside one site block, so guarded
-and open hostnames are routed separately. With wildcard certificates, subdomain
-labels are folded into the leftmost label (`dev1-app.project.example.com`) so
-the certificate covers them. Adding a subdomain to a project whose environments
-are already up takes effect on `dev-env warm`.
+and open hostnames are routed separately. Subdomain labels are folded into the
+wildcard-covered leftmost label (`app-pkliinp6.project.example.com`) so the
+project's certificate covers them. Adding a subdomain to a project whose
+environments are already up takes effect on `dev-env warm`.
 
 ## Seed data
 
 `dev-env up` restores `~/dev-envs/dumps/<project>-seed.pdump` if present, and
-starts from a bare schema otherwise. `dev-env seed <slot>` rebuilds an existing
-environment's database from it.
+starts from a bare schema otherwise. `dev-env seed <branch>` rebuilds an
+existing environment's database from it.
 
-## Why a fixed pool
+## Certificates and capacity
 
-By default Caddy issues one certificate per hostname, and Let's Encrypt caps new
-certificates per registered domain per week. Reusing a small pool of slots means
-those hostnames are issued once and thereafter only renewed. A configured
-wildcard certificate covers the whole project instead. Freeing a slot leaves a
-placeholder Caddy site behind so renewal continues while it is idle.
+Let's Encrypt caps new certificates per registered domain per week, and
+randomized hostnames would each need one, so per-hostname issuance cannot work.
+Each project instead holds a single wildcard certificate for
+`*.<project>.<base domain>`, obtained through DNS-01, under which environments
+come and go freely: creating one adds a route, removing one deletes it, and
+neither touches issuance. Practical capacity is bounded by `port_range` and
+machine resources, not by a configured environment count.
 
-Basic-auth passwords are per slot and persist across teardown, so credentials
-saved in a browser keep working when a slot is reused.
+Basic-auth passwords live exactly as long as their environment record: created
+on `up`, stable across restarts, removed on `down`.
+
+## Migrating from the fixed-pool version
+
+There is no legacy-state detection or migration; the cut is clean:
+
+1. Use the old version to tear down each `devN` environment, passing
+   `--keep-worktree` where its checkout must remain.
+2. Remove old parked and exact-host managed Caddy files, old slot state and old
+   slot secrets.
+3. Configure wildcard DNS, Caddy's DNS provider module and provider credentials.
+4. Remove `pool_size` from `config.json` and rerun `dev-env setup`.
+5. Bring each desired branch up again — preserved worktrees are adopted
+   automatically — supplying `--id` only when a chosen hostname is wanted.
 
 ## Development
 

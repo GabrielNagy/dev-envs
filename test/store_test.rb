@@ -11,26 +11,28 @@ class StoreTest < Minitest::Test
     @store = DevEnv::Store.new(state_dir: config.state_dir, run_dir: config.run_dir)
   end
 
+  KEY = "proj--feature--4001"
+
   def test_state_roundtrip_keys_and_delete
-    assert_raises(DevEnv::Error) { @store.load("proj-dev1") }
-    @store.save("proj-dev1", { "slot" => "dev1", "port" => 4001 })
-    assert_equal ["proj-dev1"], @store.keys
-    assert_equal 4001, @store.load("proj-dev1")["port"]
-    @store.delete("proj-dev1")
-    refute @store.exist?("proj-dev1")
+    assert_raises(DevEnv::Error) { @store.load(KEY) }
+    @store.save(KEY, { "branch" => "feature", "port" => 4001 })
+    assert_equal [KEY], @store.keys
+    assert_equal 4001, @store.load(KEY)["port"]
+    @store.delete(KEY)
+    refute @store.exist?(KEY)
   end
 
   def test_env_file_roundtrip
-    assert_raises(DevEnv::Error) { @store.saved_env("proj-dev1") }
-    @store.write_env("proj-dev1", { "PORT" => "4001", "DATABASE_URL" => "postgresql:///x" })
-    assert_equal({ "PORT" => "4001", "DATABASE_URL" => "postgresql:///x" }, @store.saved_env("proj-dev1"))
+    assert_raises(DevEnv::Error) { @store.saved_env(KEY) }
+    @store.write_env(KEY, { "PORT" => "4001", "DATABASE_URL" => "postgresql:///x" })
+    assert_equal({ "PORT" => "4001", "DATABASE_URL" => "postgresql:///x" }, @store.saved_env(KEY))
   end
 
   def test_launcher_is_executable_and_execs_the_server
-    @store.write_launcher("proj-dev1", "/work/tree", "bin/rails server -p 4001")
-    script = File.read(@store.run_path("proj-dev1"))
+    @store.write_launcher(KEY, "/work/tree", "bin/rails server -p 4001")
+    script = File.read(@store.run_path(KEY))
     assert_includes script, "cd /work/tree || exit 1"
     assert_includes script, "exec bin/rails server -p 4001"
-    assert File.executable?(@store.run_path("proj-dev1"))
+    assert File.executable?(@store.run_path(KEY))
   end
 end

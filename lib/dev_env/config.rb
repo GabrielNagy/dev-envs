@@ -27,22 +27,33 @@ module DevEnv
 
     def base_domain     = settings["base_domain"]
     def basic_auth_user = settings.fetch("basic_auth_user", "dev")
-    def pool_size       = settings.fetch("pool_size", 3)
 
-    def wildcard_certificates? = !settings.fetch("acme_dns_provider", "").strip.empty?
-    def acme_dns_provider      = settings.fetch("acme_dns_provider", "").strip
-
-    def free_port(reserved: [])
-      low, high = settings.fetch("port_range", [4000, 4999])
-      (low..high).to_a.shuffle.find { |port| !reserved.include?(port) && !port_taken?(port) } ||
-        raise(Error, "no free port available in #{low}..#{high}")
+    # Environments get unbounded randomized hostnames, so per-hostname
+    # certificates would grow issuance without limit; one DNS-01 wildcard
+    # certificate per project is required instead.
+    def acme_dns_provider
+      provider = settings.fetch("acme_dns_provider", "").strip
+      if provider.empty?
+        raise Error, "acme_dns_provider is not set in #{path} — randomized hostnames need one " \
+                     "wildcard certificate per project, issued through a DNS-01 provider (e.g. \"route53\")"
+      end
+      provider
     end
 
-    def port_taken?(port)
-      TCPServer.new("127.0.0.1", port).close
-      false
-    rescue Errno::EADDRINUSE, Errno::EACCES
-      true
+    # Reserve a free loopback port and return the listening socket, so the
+    # port stays claimed while an environment is prepared. The caller closes
+    # it immediately before starting the service that binds the port.
+    def reserve_port(reserved: [])
+      low, high = settings.fetch("port_range", [4000, 4999])
+      (low..high).to_a.shuffle.each do |port|
+        next if reserved.include?(port)
+        begin
+          return TCPServer.new("127.0.0.1", port)
+        rescue Errno::EADDRINUSE, Errno::EACCES
+          next
+        end
+      end
+      raise Error, "no free port available in #{low}..#{high}"
     end
 
     private
