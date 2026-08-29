@@ -12,32 +12,31 @@ class ProjectTest < Minitest::Test
   def test_derived_names_and_paths
     project = build_project(@config, {}, root: "/repos/My App")
     assert_equal "my-app", project.name
-    assert_equal "my-app--dev-env-support--4593", project.key_for("dev-env-support", 4593)
-    assert_equal "pkliinp6.my-app.example.com", project.domain_for("pkliinp6")
+    assert_equal "my-app--dev-env-support--pkliinp6", project.key_for("dev-env-support", "pkliinp6")
+    assert_equal "pkliinp6-my-app.example.com", project.domain_for("pkliinp6")
     assert_equal "dev_env_my_app_4593_pkliinp6", project.database_for(4593, "pkliinp6")
     assert_equal "/repos/My App-worktrees", project.worktree_root
     assert_equal File.join(@config.dump_dir, "my-app-seed.pdump"), project.default_dump
   end
 
-  def test_colliding_branch_slugs_stay_distinct_through_the_port
+  def test_artifact_keys_keep_colliding_branch_slugs_distinct_through_the_environment_id
     project = build_project(@config, { "name" => "proj" })
-    assert_equal "proj--feature-foo--4001", project.key_for("feature/foo", 4001)
-    assert_equal "proj--feature-foo--4002", project.key_for("feature-foo", 4002)
-    refute_equal project.key_for("feature/foo", 4001), project.key_for("feature-foo", 4002)
+    assert_equal "proj--feature-foo--aaaaaaaa", project.key_for("feature/foo", "aaaaaaaa")
+    assert_equal "proj--feature-foo--bbbbbbbb", project.key_for("feature-foo", "bbbbbbbb")
   end
 
   def test_longest_database_name_fits_postgres_limit
     project = build_project(@config, { "name" => "a" * DevEnv::Util::MAX_LABEL })
-    database = project.database_for(65_535, "abcd-efg")
+    database = project.database_for(65_535, "abcdefgh")
     assert_operator database.bytesize, :<=, 63
-    assert_equal "dev_env_#{'a' * 40}_65535_abcd_efg", database
+    assert_equal "dev_env_#{'a' * 40}_65535_abcdefgh", database
   end
 
   def test_database_adapter_shapes_dump_name_and_database_url
     project = build_project(@config, { "name" => "proj", "database" => { "adapter" => "mysql", "user" => "sample_dev" } })
     assert_equal File.join(@config.dump_dir, "proj-seed.sql"), project.default_dump
 
-    state = { "domain" => "pkliinp6.proj.example.com", "port" => 4001, "database" => "db",
+    state = { "domain" => "pkliinp6-proj.example.com", "port" => 4001, "database" => "db",
               "branch" => "x", "project" => "proj", "worktree" => "/wt" }
     assert_equal "mysql2://sample_dev@127.0.0.1:3306/db", project.vars_for(state)["DATABASE_URL"]
   end
@@ -73,24 +72,24 @@ class ProjectTest < Minitest::Test
 
   def test_subdomain_labels_fold_into_the_wildcard_covered_leftmost_label
     project = build_project(@config)
-    assert_equal "pkliinp6.p.example.com", project.host_for("pkliinp6.p.example.com", "")
-    assert_equal "app-pkliinp6.p.example.com", project.host_for("pkliinp6.p.example.com", "app")
+    assert_equal "pkliinp6-p.example.com", project.host_for("pkliinp6-p.example.com", "")
+    assert_equal "app-pkliinp6-p.example.com", project.host_for("pkliinp6-p.example.com", "app")
   end
 
   def test_vars_and_app_env
     project = build_project(@config, { "name" => "proj", "env" => { "HOST" => "${APP_DOMAIN}" } })
-    state = { "domain" => "pkliinp6.proj.example.com", "port" => 4001, "database" => "db",
+    state = { "domain" => "pkliinp6-proj.example.com", "port" => 4001, "database" => "db",
               "branch" => "feature/x", "project" => "proj", "worktree" => "/wt" }
     vars = project.vars_for(state)
-    assert_equal "app-pkliinp6.proj.example.com", vars["APP_DOMAIN"]
-    assert_equal "app\\-pkliinp6\\.proj\\.example\\.com", vars["APP_DOMAIN_RE"]
-    assert_equal "3", vars["TLD_LENGTH"]
+    assert_equal "app-pkliinp6-proj.example.com", vars["APP_DOMAIN"]
+    assert_equal "app\\-pkliinp6\\-proj\\.example\\.com", vars["APP_DOMAIN_RE"]
+    assert_equal "2", vars["TLD_LENGTH"]
     assert_equal "feature/x", vars["BRANCH"]
     refute vars.key?("SLOT")
     assert_equal "postgresql:///db", vars["DATABASE_URL"]
 
     env = project.app_env_for(vars)
-    assert_equal "app-pkliinp6.proj.example.com", env["HOST"]
+    assert_equal "app-pkliinp6-proj.example.com", env["HOST"]
     assert_equal "4001", env["PORT"]
     assert_equal "/wt", env["WORKTREE"]
     assert_includes env["PATH"], "/usr/bin"

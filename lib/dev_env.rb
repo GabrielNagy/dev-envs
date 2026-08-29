@@ -13,7 +13,7 @@ require "time"
 # is created on demand for one branch: a git worktree, a database (postgres
 # unless the project declares another engine), a loopback port and a systemd
 # user unit, with Caddy terminating TLS in front
-# through one wildcard certificate per project. See README.md.
+# through one wildcard certificate for the base domain. See README.md.
 module DevEnv
   # Every user-facing failure; the CLI prints it and exits 1.
   class Error < StandardError; end

@@ -11,7 +11,7 @@ class StoreTest < Minitest::Test
     @store = DevEnv::Store.new(state_dir: config.state_dir, run_dir: config.run_dir)
   end
 
-  KEY = "proj--feature--4001"
+  KEY = "proj--feature--epxrnilj"
 
   def test_state_roundtrip_keys_and_delete
     assert_raises(DevEnv::Error) { @store.load(KEY) }

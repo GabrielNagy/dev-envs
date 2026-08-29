@@ -5,7 +5,7 @@ require_relative "test_helper"
 class SecretsTest < Minitest::Test
   include DevEnvTest
 
-  KEY = "proj--feature--4001"
+  KEY = "proj--feature--epxrnilj"
 
   def setup
     @dir = Dir.mktmpdir.tap { |d| (@tmp_dirs ||= []) << d }

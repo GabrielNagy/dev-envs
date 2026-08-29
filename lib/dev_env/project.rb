@@ -62,17 +62,17 @@ module DevEnv
       @settings["worktree_root"] || File.join(File.dirname(root), "#{File.basename(root)}-worktrees")
     end
 
-    # The runtime key names every generated artifact. The port keeps branches
-    # with colliding slugs (feature/foo, feature-foo) distinct, and slugs
-    # contain only single hyphens, so `--` is an unambiguous separator.
-    def key_for(branch, port) = "#{name}--#{slugify(branch)}--#{port}"
+    # Generated artifacts share a descriptive key while the environment ID
+    # remains the concise external selector.
+    def key_for(branch, id) = "#{name}--#{slugify(branch)}--#{id}"
 
-    def domain_for(identifier) = "#{identifier}.#{name}.#{@config.base_domain}"
+    # Keep every environment directly beneath the machine's base domain so
+    # one wildcard DNS record and certificate cover every project.
+    def domain_for(id) = "#{id}-#{name}.#{@config.base_domain}"
 
-    # "dev_env_" plus a 40-character name, a 5-digit port and an 8-character
-    # identifier is exactly PostgreSQL's 63-byte identifier limit (MySQL
-    # allows 64).
-    def database_for(port, identifier) = "dev_env_#{name.tr('-', '_')}_#{port}_#{identifier.tr('-', '_')}"
+    # "dev_env_" plus a 40-character name, a 5-digit port and the 8-character
+    # ID is exactly PostgreSQL's 63-byte identifier limit (MySQL allows 64).
+    def database_for(port, id) = "dev_env_#{name.tr('-', '_')}_#{port}_#{id.tr('-', '_')}"
 
     def default_dump = File.join(@config.dump_dir, @settings["seed"] || "#{name}-seed#{database.dump_extension}")
 
@@ -99,7 +99,7 @@ module DevEnv
     end
 
     # Subdomain labels are folded into the leftmost label
-    # (app-pkliinp6.project.example.com) so the project's wildcard
+    # (app-pkliinp6-project.example.com) so the machine-wide wildcard
     # certificate covers them.
     def host_for(domain, label)
       return domain if label.empty?

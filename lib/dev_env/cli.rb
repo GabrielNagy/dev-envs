@@ -14,10 +14,11 @@ module DevEnv
 
       Per machine:
         setup             Detect the public address, write the Caddy config and unit
-      Per project (run inside its repository):
+      Environments and projects:
         init              Write a starter .dev-env.json
         up [branch]       Create an environment: worktree, database and service
-        down [branch]     Tear an environment down
+        down [id]         Tear down an environment by its immutable ID
+        down --all        Tear down every environment on this machine
         list (ls)         Show every environment
         creds [branch]    Show the basic-auth credentials
         logs [branch] [-f]
@@ -29,14 +30,13 @@ module DevEnv
         seed [branch]     Rebuild the database from the seed dump
         warm              Rewrite recorded Caddy sites and pre-issue certificates
 
-      Run from inside an environment's worktree, commands taking [branch] default
-      to that environment when the branch is omitted. `up` defaults to the branch
-      checked out in the current directory.
+      Run from inside an environment's worktree, commands taking [branch] and
+      `down` default to that environment when their target is omitted. `up`
+      defaults to the branch checked out in the current directory.
 
       Environments are created on demand, each served at an HTTPS hostname whose
-      leftmost label is a random identifier (or one chosen with `up --id`), with
-      the subdomains and which of them sit behind basic auth declared in
-      .dev-env.json
+      leftmost label combines its immutable ID and the project name. Subdomains
+      and which of them sit behind basic auth are declared in .dev-env.json
     TEXT
 
     def initialize(config: Config.new)
@@ -49,7 +49,7 @@ module DevEnv
       if command.nil? || %w[-h --help help].include?(command)
         puts USAGE
       elsif COMMANDS.include?(command)
-        if @config.exist? && %w[setup up down creds seed warm].include?(command)
+        if @config.exist? && %w[up creds seed warm].include?(command)
           Caddy.new(@config).ensure_certificate_configuration!
         end
         send("cmd_#{command}", argv)
@@ -64,7 +64,12 @@ module DevEnv
 
     # ------------------------------------------------------------------ setup
 
-    def cmd_setup(_argv)
+    def cmd_setup(argv)
+      parser = OptionParser.new do |o|
+        o.banner = "Usage: dev-env setup"
+      end
+      parser.parse!(argv)
+
       ip = capture("sh", "-c", "ip -4 route get 1.1.1.1 2>/dev/null | grep -oP 'src \\K[0-9.]+'")
       raise Error, "could not detect a public IPv4 address" if ip.empty?
       FileUtils.mkdir_p([@config.home, @config.state_dir, @config.dump_dir, @config.run_dir, @config.secret_dir])
@@ -79,13 +84,14 @@ module DevEnv
           "acme_dns_provider" => "",
         }) + "\n")
         ok "Wrote #{@config.path} — set base_domain, acme_email and acme_dns_provider " \
-           "(e.g. \"route53\"), then re-run setup. Each project is served under one " \
-           "wildcard certificate, so a DNS-01 provider is required and its credentials " \
+           "(e.g. \"route53\"), then re-run setup. Every project is served under one " \
+           "base-domain wildcard certificate, so a DNS-01 provider is required and its credentials " \
            "must be available to Caddy."
         return
       end
 
       @config.acme_dns_provider # required; fail here rather than on the first `up`
+      prepare_base_domain_change!
       if @config["bind_ip"] != ip
         note "config bind_ip is #{@config['bind_ip'].inspect} but this box answers on #{ip}"
       end
@@ -95,6 +101,7 @@ module DevEnv
       run("sudo", "mkdir", "-p", @config.sites_dir)
       run("sudo", "chown", "#{ENV['USER']}:caddy", @config.sites_dir)
       run("sudo", "chmod", "2775", @config.sites_dir)
+      Caddy.new(@config).ensure_wildcard_site
       run("sudo", "systemctl", "restart", "caddy")
 
       systemd.install
@@ -132,7 +139,6 @@ module DevEnv
       options = { public: project.public?, base: "origin/main" }
       parser = OptionParser.new do |o|
         o.banner = "Usage: dev-env up [branch] [options]"
-        o.on("--id ID", "Hostname identifier: a lowercase DNS label of at most 8 characters (default: random)") { |v| options[:id] = v }
         o.on("--seed PATH", "Dump to restore (default: #{project.default_dump})") { |v| options[:seed] = v; options[:seed_given] = true }
         o.on("--no-seed", "Skip the dump; build the schema from migrations") { options[:no_seed] = true }
         o.on("--public", "Serve without HTTP basic auth (overrides .dev-env.json)") { options[:public] = true }
@@ -148,9 +154,10 @@ module DevEnv
       # recorded environment may exist for it.
       if (existing = project_states.find { |state| state["branch"] == branch })
         raise Error, "#{project.name} already has an environment for #{branch.inspect} " \
-                     "(https://#{existing['domain']}) — tear it down first: dev-env down #{branch}"
+                     "(https://#{existing['domain']}) — tear it down first: dev-env down #{existing['id']}"
       end
-      identifier = options[:id] ? validate_identifier!(options[:id]) : generate_identifier
+      id = generate_environment_id
+      key = project.key_for(branch, id)
 
       # Hold the port's socket open while the environment is prepared, so no
       # other process can claim it during a long build. Released immediately
@@ -158,19 +165,19 @@ module DevEnv
       reservation = @config.reserve_port(reserved: store.keys.map { |k| store.load(k)["port"] })
       begin
         port = reservation.addr[1]
-        key = project.key_for(branch, port)
-        database = project.database_for(port, identifier)
+        database = project.database_for(port, id)
         # git allows a branch in only one worktree, so a checkout that already exists is the one to
         # serve, not a conflict to refuse. An agent's worktree is the common case.
         worktree = File.expand_path(options[:worktree_path] || worktrees.existing_for(branch) ||
-                                    File.join(project.worktree_root, "#{slugify(branch)}--#{port}"))
+                                    File.join(project.worktree_root, "#{slugify(branch)}--#{id}"))
         worktrees.verify_adopted!(worktree, branch) if Dir.exist?(worktree)
         seed = options[:no_seed] ? nil : (options[:seed] || project.default_dump)
 
         state = {
-          "key" => key, "project" => project.name, "branch" => branch,
-          "identifier" => identifier, "domain" => project.domain_for(identifier),
+          "id" => id, "key" => key, "project" => project.name, "branch" => branch,
+          "domain" => project.domain_for(id),
           "port" => port, "database" => database, "worktree" => worktree,
+          "project_root" => project.root,
           # Only a worktree this command created may be torn down by it, on rollback or on `down`.
           "worktree_owned" => !Dir.exist?(worktree),
           "basic_auth" => !options[:public] && project.subdomains.any? { |sub| sub["auth"] },
@@ -178,6 +185,9 @@ module DevEnv
           "database_settings" => project.database_settings,
           "created_at" => Time.now.utc.iso8601,
         }
+        # Persist the fully resolved commands so teardown by ID never depends
+        # on the caller's current repository or a later config change.
+        state["after_down"] = project.after_down.map { |command| interpolate(command, project.vars_for(state)) }
         # The primary plus any the project declares as extra, resolved here so
         # `down` drops exactly what `up` created even if .dev-env.json changes.
         state["databases"] = [database, *project.database.extra_names(project.vars_for(state))]
@@ -227,15 +237,47 @@ module DevEnv
     # ------------------------------------------------------------- lifecycle
 
     def cmd_down(argv)
-      options = { worktree: true, database: true }
+      options = { worktree: true, database: true, all: false }
       parser = OptionParser.new do |o|
-        o.banner = "Usage: dev-env down [branch] [options]"
+        o.banner = "Usage: dev-env down [id] [options]"
+        o.on("--all", "Tear down every recorded environment") { options[:all] = true }
         o.on("--keep-worktree", "Leave the git worktree in place") { options[:worktree] = false }
-        o.on("--remove-worktree", "Remove a worktree whose origin predates ownership tracking") { options[:force_worktree] = true }
         o.on("--keep-database", "Leave the database in place") { options[:database] = false }
       end
       parser.parse!(argv)
-      key = resolve_target(argv, parser.banner)
+
+      if options.delete(:all)
+        raise Error, "#{parser.banner}\n  an environment ID cannot be combined with --all" unless argv.empty?
+
+        keys = store.keys
+        return puts("No environments.") if keys.empty?
+
+        failures = []
+        keys.each do |key|
+          teardown_environment(key, options, reload_caddy: false)
+        rescue Error => error
+          failures << [key, error]
+          note "Failed to remove #{key}: #{error.message}"
+        end
+        teardown_caddy.reload
+        unless failures.empty?
+          raise Error, "failed to remove #{failures.length} environment#{'s' unless failures.one?}: " \
+                       "#{failures.map(&:first).join(', ')}"
+        end
+        return ok("All environments removed")
+      end
+
+      raise Error, parser.banner if argv.length > 1
+      key = if argv.empty?
+              implicit_key || raise(Error, "#{parser.banner}\n  no ID given, and #{Dir.pwd} is not inside an environment's worktree")
+            else
+              id = argv.shift
+              environment_key_for(id) || raise(Error, "no environment #{id.inspect} (try: dev-env list)")
+            end
+      teardown_environment(key, options)
+    end
+
+    def teardown_environment(key, options, reload_caddy: true)
       state = store.load(key)
 
       systemd.configure_process_manager(key, process_manager_for(state))
@@ -245,10 +287,10 @@ module DevEnv
       run_after_down(state, options)
 
       step "Removing Caddy site"
-      # The wildcard certificate is per project, so removing this hostname's
-      # route costs nothing at the next `up`.
-      caddy.delete_site(key)
-      caddy.reload
+      # The wildcard certificate is shared by every project, so removing this
+      # hostname's route costs nothing at the next `up`.
+      teardown_caddy.delete_site(key)
+      teardown_caddy.reload if reload_caddy
 
       if options[:database]
         db = database_for(state)
@@ -258,24 +300,16 @@ module DevEnv
         end
       end
 
-      # `remove --force` discards uncommitted work and cannot be undone, so removal requires positive
-      # evidence that dev-env created this worktree. Three states, not two:
-      #   true  — dev-env created it; remove it.
-      #   false — adopted from elsewhere; never remove it, and no flag overrides that.
-      #   nil   — written before ownership was recorded, so unknown. Older `up` silently adopted a
-      #           worktree that already sat at the default path, which is exactly where agents put
-      #           theirs, so "unknown" cannot be treated as "ours". Left alone unless forced.
+      # `remove --force` discards uncommitted work and cannot be undone, so
+      # removal requires positive evidence that dev-env created this worktree.
       owned = state["worktree_owned"]
       if !options[:worktree]
         note "Leaving worktree #{state['worktree']} (--keep-worktree)" if owned
-      elsif owned == true || (owned.nil? && options[:force_worktree])
+      elsif owned
         step "Removing worktree #{state['worktree']}"
-        worktrees.remove(state["worktree"])
-      elsif owned == false
-        note "Leaving worktree #{state['worktree']} — dev-env did not create it"
+        Worktrees.remove(state["worktree"], root: state["project_root"])
       else
-        note "Leaving worktree #{state['worktree']} — predates ownership tracking, so it may be " \
-             "an adopted checkout. Remove it yourself, or re-run with --remove-worktree."
+        note "Leaving worktree #{state['worktree']} — dev-env did not create it"
       end
 
       secrets.delete_password(key)
@@ -290,17 +324,17 @@ module DevEnv
 
       rows = keys.map do |key|
         state = store.load(key)
-        [state["project"].to_s, state["branch"].to_s,
+        [state["id"].to_s, state["project"].to_s, state["branch"].to_s,
          state["port"].to_s, systemd.status(key), "https://#{state['domain']}"]
       end
-      headers = %w[PROJECT BRANCH PORT STATUS URL]
+      headers = %w[ID PROJECT BRANCH PORT STATUS URL]
       widths = headers.each_with_index.map { |h, i| ([h] + rows.map { |r| r[i] }).map(&:length).max }
 
       puts color(headers.each_with_index.map { |h, i| h.ljust(widths[i]) }.join("  "), BOLD)
       rows.each do |row|
         cells = row.each_with_index.map { |c, i| c.ljust(widths[i]) }
-        cells[3] = color(cells[3], row[3] == "active" ? GREEN : RED)
-        cells[4] = color(cells[4], CYAN)
+        cells[4] = color(cells[4], row[4] == "active" ? GREEN : RED)
+        cells[5] = color(cells[5], CYAN)
         puts cells.join("  ")
       end
     end
@@ -368,15 +402,15 @@ module DevEnv
     # better one.
     def cmd_activate(argv)
       key = resolve_target(argv, "Usage: dev-env activate [branch]")
+      state = store.load(key)
       if nested_in_active_shell?
         # A child process cannot make its parent shell exit, so a shell
         # started here could only nest inside the active one. Refuse instead.
         raise Error, "already inside #{ENV['DEV_ENV_ACTIVE']} — `exit` first, or switch shells " \
-                     "in place with `exec dev-env activate #{key}`"
+                     "in place with `exec dev-env activate #{state['id']}`"
       end
-      state = store.load(key)
-      env = store.saved_env(key).except("PATH").merge("DEV_ENV_ACTIVE" => key)
-      ok "Entering #{key} (#{state['worktree']}) — exit to leave"
+      env = store.saved_env(key).except("PATH").merge("DEV_ENV_ACTIVE" => state["id"])
+      ok "Entering #{state['id']} (#{state['worktree']}) — exit to leave"
       $stdout.flush # exec replaces the process before Ruby flushes buffered output
       exec(env, ENV.fetch("SHELL", "/bin/sh"), chdir: state["worktree"])
     end
@@ -453,14 +487,13 @@ module DevEnv
     def store    = @store    ||= Store.new(state_dir: @config.state_dir, run_dir: @config.run_dir)
     def secrets  = @secrets  ||= Secrets.new(@config.secret_dir)
     def caddy    = @caddy    ||= Caddy.new(@config, project: project)
+    def teardown_caddy = @teardown_caddy ||= Caddy.new(@config)
     def worktrees = @worktrees ||= Worktrees.new(project)
     def systemd   = @systemd   ||= Systemd.new(unit_path: @config.unit_path, env_dir: @config.state_dir, run_dir: @config.run_dir)
-    def process_manager_for(state) = state.fetch("process_manager") { project.process_manager }
+    def process_manager_for(state) = state["process_manager"]
 
-    # Adapter and database list are recorded at `up`; environments from before
-    # adapters carry neither and were always postgres with one database.
     def database_for(state)  = Database.for(state["database_settings"])
-    def databases_for(state) = state["databases"] || [state["database"]]
+    def databases_for(state) = state["databases"]
 
     # Project-defined teardown, mirroring after_restore. Runs after the service
     # stops and before anything is removed, so hooks still see the worktree,
@@ -469,23 +502,29 @@ module DevEnv
     # repository's worktree, say) cleans them up here. Hook failures warn but
     # never abort `down` — aborting halfway through teardown leaves a zombie.
     def run_after_down(state, options)
-      hooks = project.after_down
+      hooks = state["after_down"]
       return if hooks.empty?
-      vars = project.vars_for(state)
-      env = project.app_env_for(vars).merge(
+      env = store.saved_env(state["key"]).merge(
         "DEV_ENV_KEEP_WORKTREE" => (!options[:worktree]).to_s,
         "DEV_ENV_KEEP_DATABASE" => (!options[:database]).to_s,
       )
-      chdir = Dir.exist?(state["worktree"].to_s) ? state["worktree"] : project.root
+      chdir = [state["worktree"], state["project_root"], @config.home].find { |path| Dir.exist?(path.to_s) }
       hooks.each do |command|
         step "Running after_down: #{command}"
-        sh(interpolate(command, vars), chdir: chdir, env: env, check: false) ||
+        sh(command, chdir: chdir, env: env, check: false) ||
           note("after_down command failed (continuing): #{command}")
       end
     rescue Error => error
-      # `down` accepts a raw runtime key and may run outside the repository,
-      # where project settings are unreachable. Removal must still proceed.
       note "Skipping after_down commands: #{error.message}"
+    end
+
+    def prepare_base_domain_change!
+      return if Caddy.new(@config).certificate_configuration_matches?
+
+      count = store.keys.length
+      return if count.zero?
+      raise Error, "base_domain cannot be changed while #{count} environment#{'s' unless count == 1} exist. " \
+                   "Run `dev-env down --all`, then `dev-env setup`"
     end
 
     # Every recorded environment of the current project.
@@ -493,32 +532,16 @@ module DevEnv
       store.keys.map { |key| store.load(key) }.select { |state| state["project"] == project.name }
     end
 
-    # A lowercase DNS label of at most eight characters: it becomes the
-    # leftmost public hostname label and part of the database name.
-    IDENTIFIER = /\A[a-z0-9](?:[a-z0-9-]{0,6}[a-z0-9])?\z/
-
-    def taken_identifiers = project_states.to_h { |state| [state["identifier"], state["branch"]] }
-
-    def validate_identifier!(id)
-      unless id.match?(IDENTIFIER)
-        raise Error, "#{id.inspect} is not a usable identifier — need a lowercase DNS label " \
-                     "of at most 8 characters"
-      end
-      if (branch = taken_identifiers[id])
-        raise Error, "identifier #{id.inspect} is already used by #{project.name}/#{branch}"
-      end
-      id
-    end
-
-    def generate_identifier
-      taken = taken_identifiers
+    # The ID is global because it names machine-wide artifacts. Retry the
+    # generated value if it belongs to a recorded environment.
+    def generate_environment_id
       loop do
-        id = random_identifier
-        return id unless taken.key?(id)
+        id = random_environment_id
+        return id unless environment_key_for(id)
       end
     end
 
-    def random_identifier = SecureRandom.alphanumeric(8).downcase
+    def random_environment_id = SecureRandom.random_number(36**8).to_s(36).rjust(8, "0")
 
     def build_environment(state, seed, options, reservation)
       key, branch, worktree, domain, port, database =
@@ -610,24 +633,29 @@ module DevEnv
                color("disabled", YELLOW)
              end
       adopted = state["worktree_owned"] ? "" : " #{color('(adopted; kept on down)', YELLOW)}"
+      puts "  #{color('ID'.ljust(10), BOLD)} #{state['id']}"
       puts "  #{color('Basic auth', BOLD)} #{auth}"
       puts "  #{color('Worktree'.ljust(10), BOLD)} #{state['worktree']}#{adopted}"
       puts "  #{color('Database'.ljust(10), BOLD)} #{databases_for(state).join(', ')}  (port #{state['port']})"
       puts
       puts "  #{color('Logs'.ljust(10), BOLD)} #{color("dev-env logs #{state['branch']} -f", CYAN)}"
-      puts "  #{color('Tear down'.ljust(10), BOLD)} #{color("dev-env down #{state['branch']}", CYAN)}"
+      puts "  #{color('Tear down'.ljust(10), BOLD)} #{color("dev-env down #{state['id']}", CYAN)}"
       puts
       puts "  #{color('Total'.ljust(10), BOLD)} #{duration_tag(total)}"
     end
 
-    # A branch names an environment by the exact `branch` recorded in state,
-    # never by reconstructing a filename from a lossy branch slug. A runtime
-    # key (from DEV_ENV_ACTIVE, say) is accepted as-is.
-    def resolve(branch_or_key)
-      return branch_or_key if store.exist?(branch_or_key)
-      match = project_states.find { |state| state["branch"] == branch_or_key }
+    # Non-destructive commands accept either an immutable environment ID or an
+    # exact branch belonging to the current project.
+    def resolve(branch_or_id)
+      key = environment_key_for(branch_or_id)
+      return key if key
+      match = project_states.find { |state| state["branch"] == branch_or_id }
       return match["key"] if match
-      raise Error, "no environment #{branch_or_key.inspect} for #{project.name} (try: dev-env list)"
+      raise Error, "no environment #{branch_or_id.inspect} for #{project.name} (try: dev-env list)"
+    end
+
+    def environment_key_for(id)
+      store.keys.find { |key| store.load(key)["id"] == id }
     end
 
     # The branch checked out in the current directory, so `up` run inside a
@@ -652,7 +680,7 @@ module DevEnv
       end.max_by { |_, root| root.length }
       return match.first if match
       active = ENV["DEV_ENV_ACTIVE"].to_s
-      active unless active.empty? || !store.exist?(active)
+      environment_key_for(active) unless active.empty?
     end
 
     # The explicit branch argument when given, otherwise the environment

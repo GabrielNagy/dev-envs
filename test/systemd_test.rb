@@ -5,9 +5,10 @@ require_relative "test_helper"
 class SystemdTest < Minitest::Test
   include DevEnvTest
 
-  def test_unit_name_uses_the_port_qualified_runtime_key
+  def test_unit_name_uses_the_descriptive_artifact_key
     systemd = DevEnv::Systemd.new(unit_path: "/tmp/x", env_dir: "/e", run_dir: "/r")
-    assert_equal "dev-env@sample--dev-env-support--4593.service", systemd.unit("sample--dev-env-support--4593")
+    key = "sample--worktree-silver-cloud-2a0f--epxrnilj"
+    assert_equal "dev-env@#{key}.service", systemd.unit(key)
   end
 
   def test_install_writes_the_template_unit
@@ -35,17 +36,17 @@ class SystemdTest < Minitest::Test
     reloads = 0
     systemd.define_singleton_method(:systemctl) { |*| reloads += 1 }
 
-    systemd.configure_process_manager("proj--feature--4001", "overmind")
-    override = File.join(dir, "dev-env@proj--feature--4001.service.d", "dev-env-overmind.conf")
+    systemd.configure_process_manager("proj--feature--epxrnilj", "overmind")
+    override = File.join(dir, "dev-env@proj--feature--epxrnilj.service.d", "dev-env-overmind.conf")
     assert_path_exists override
     assert_includes File.read(override), "KillMode=mixed"
     assert_includes File.read(override), '.overmind.sock'
     assert_equal 1, reloads
 
-    systemd.configure_process_manager("proj--feature--4001", "overmind")
+    systemd.configure_process_manager("proj--feature--epxrnilj", "overmind")
     assert_equal 1, reloads
 
-    systemd.configure_process_manager("proj--feature--4001", "foreman")
+    systemd.configure_process_manager("proj--feature--epxrnilj", "foreman")
     refute_path_exists override
     assert_equal 2, reloads
   end

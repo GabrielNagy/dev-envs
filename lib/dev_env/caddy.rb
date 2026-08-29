@@ -1,17 +1,20 @@
 # frozen_string_literal: true
 
 module DevEnv
-  # Caddy site management: the per-project wildcard site holding one DNS-01
-  # certificate, and the per-environment route files imported into it.
+  # Caddy site management: one machine-wide DNS-01 wildcard certificate, and
+  # the per-environment route files imported into it.
   class Caddy
     include Util
+
+    WILDCARD_SITE = "_dev-env.wildcard.caddy"
+    ROUTES_DIR = "_dev-env-routes"
 
     def initialize(config, project: nil)
       @config = config
       @project = project
     end
 
-    def site_path(key) = File.join(project_sites_dir, "#{key}.caddy")
+    def site_path(key) = File.join(routes_dir, "#{key}.caddy")
 
     def write_site(key, domain, port, password)
       auth = password ? "\n\tbasic_auth {\n\t\t#{@config.basic_auth_user} #{hash_password(password)}\n\t}" : ""
@@ -19,35 +22,37 @@ module DevEnv
       blocks = []
       blocks << site_block(key, "guarded", @project.hosts_for(domain, guarded), "reverse_proxy 127.0.0.1:#{port}#{auth}") if guarded.any?
       blocks << site_block(key, "open", @project.hosts_for(domain, open), "reverse_proxy 127.0.0.1:#{port}") if open.any?
-      FileUtils.mkdir_p(project_sites_dir)
+      FileUtils.mkdir_p(routes_dir)
       File.write(site_path(key), "# Managed by dev-env — regenerated on `up`, removed on `down`.\n" + blocks.join("\n"))
     end
 
     def ensure_wildcard_site
-      FileUtils.mkdir_p(project_sites_dir)
-      File.write(File.join(@config.sites_dir, "#{@project.name}.wildcard.caddy"), <<~CADDY)
-        # Managed by dev-env — one wildcard site covering every environment in this project.
-        https://*.#{@project.name}.#{@config.base_domain} {
+      FileUtils.mkdir_p(routes_dir)
+      File.write(wildcard_site_path, <<~CADDY)
+        # Managed by dev-env — one wildcard site covering every project and environment.
+        https://*.#{@config.base_domain} {
           tls {
             dns #{@config.acme_dns_provider}
           }
-          import #{project_sites_dir}/*.caddy
+          import #{routes_dir}/*.caddy
         }
       CADDY
     end
 
     # base_domain is a setup-time choice; flipping it while managed sites
     # exist would strand certificates and hostnames.
-    def ensure_certificate_configuration!
-      mismatched = managed_sites("*.wildcard.caddy").reject do |path|
-        name = File.basename(path).delete_suffix(".wildcard.caddy")
-        File.read(path).include?("https://*.#{name}.#{@config.base_domain} {")
-      end
-      return if mismatched.empty?
+    def certificate_configuration_matches?
+      return true unless File.file?(wildcard_site_path)
+      return true unless File.open(wildcard_site_path, &:gets).to_s.start_with?("# Managed by dev-env")
 
-      raise Error, "base_domain changed while wildcard Caddy sites exist. Restore the previous base_domain, " \
-                   "tear down active environments, then remove the managed sites under #{@config.sites_dir} " \
-                   "before applying this change"
+      File.read(wildcard_site_path).include?("https://*.#{@config.base_domain} {")
+    end
+
+    def ensure_certificate_configuration!
+      return if certificate_configuration_matches?
+
+      raise Error, "configured base_domain does not match the managed wildcard Caddy site. Run " \
+                   "`dev-env down --all`, then `dev-env setup` to apply the new base_domain"
     end
 
     # Validate first: reloading a broken configuration would take every
@@ -67,7 +72,7 @@ module DevEnv
 
     def caddyfile_content
       <<~CADDY
-        # Managed by dev-env — per-environment sites live in #{@config.sites_dir}/*.caddy
+        # Managed by dev-env — wildcard and environment routes live under #{@config.sites_dir}
         #
         # default_bind pins Caddy to the public address. A wildcard bind can fail
         # with EADDRINUSE when something else (tailscaled, for one) already holds :443
@@ -83,16 +88,11 @@ module DevEnv
 
     private
 
-    def project_sites_dir = File.join(@config.sites_dir, @project.name)
+    def routes_dir = File.join(@config.sites_dir, ROUTES_DIR)
+    def wildcard_site_path = File.join(@config.sites_dir, WILDCARD_SITE)
 
-    def managed_sites(pattern)
-      Dir.glob(File.join(@config.sites_dir, pattern)).select do |path|
-        File.file?(path) && File.open(path, &:gets).to_s.start_with?("# Managed by dev-env")
-      end
-    end
-
-    # The site file is imported into the project's wildcard site, so it holds
-    # matcher + handle pairs rather than a top-level site block.
+    # The site file is imported into the machine-wide wildcard site, so it
+    # holds matcher + handle pairs rather than a top-level site block.
     def site_block(key, part, hosts, body)
       matcher = "#{key.tr('-', '_')}_#{part}"
       "@#{matcher} host #{hosts.join(' ')}\nhandle @#{matcher} {\n\t#{body}\n}\n"

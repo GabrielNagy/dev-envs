@@ -6,8 +6,8 @@ module DevEnv
   module Util
     module_function
 
-    # A key becomes a DNS label, a database name and a systemd instance name,
-    # so keep it to the intersection of what all three accept.
+    # A project slug becomes a DNS label and part of its database names, so
+    # keep it to the intersection of what both accept.
     MAX_LABEL = 40
 
     BOLD    = "1"

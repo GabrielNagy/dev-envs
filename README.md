@@ -6,7 +6,7 @@ clicked through in a real browser rather than only asserted about in tests.
 An environment is created on demand for one branch, bundling a git worktree, a
 database (postgres by default, MariaDB/MySQL on request), a loopback port and a
 systemd user unit. Caddy terminates TLS in front through one wildcard
-certificate per project.
+certificate for the machine's base domain.
 
 ```
 dev-env up <branch>     # create an environment
@@ -15,39 +15,41 @@ dev-env creds [branch]  # basic-auth credentials
 dev-env logs [branch] -f  # follow the log
 dev-env exec [branch] -c "bin/rails db:migrate:status"  # run one command in its context
 dev-env activate [branch]  # open a shell in its worktree + env; exit to leave
-dev-env down [branch]   # tear the environment down
+dev-env down <id>       # tear one environment down by its immutable ID
+dev-env down --all      # tear every active or inactive environment down
 ```
 
-Run from inside an environment's worktree, every command taking `[branch]`
-infers it from the current directory, so the argument can be omitted.
+Run from inside an environment's worktree, every command taking `[branch]` and
+`down` infer the environment from the current directory when their target is
+omitted.
 
-Environments are served at `https://<identifier>.<project>.<base domain>`,
-plus one hostname per subdomain the project declares — by default `app`, folded
-into the leftmost label as `https://app-<identifier>.<project>.<base domain>`.
-The identifier is a random eight-character label, or one chosen with
-`up --id <label>` (a lowercase DNS label of at most eight characters, rejected
-if invalid or already used by another environment of the same project):
+Environments are served at `https://<id>-<project>.<base domain>`, plus one
+hostname per subdomain the project declares — by default `app`, folded into the
+leftmost label as `https://app-<id>-<project>.<base domain>`. The ID is a random
+8-character lowercase alphanumeric string:
 
 ```sh
-dev-env up dev-env-support                 # e.g. https://pkliinp6.sample.example.com
-dev-env up dev-env-support --id pkliinp6   # a stable, recognizable hostname
+dev-env up dev-env-support   # e.g. https://epxrnilj-sample.example.com
 ```
 
-The identifier, port, URL and password stay fixed while the environment record
+The same immutable ID is shown by `up` and `list` and accepted by explicit
+teardown, so teardown never depends on a branch name or the caller's current
+project. The ID, port, URL and password stay fixed while the environment record
 exists, including across restarts and inactive periods. `down` ends that
-lifetime; bringing the same branch up later creates a new environment and may
-choose a new identifier, port, URL and password. The project's `public` setting,
-or an `up --public`/`up --private` override, only changes basic auth; the hostname
-is chosen the same way.
+lifetime; bringing the same branch up later creates a new environment with a
+new ID and may choose a new port, URL and password. The project's `public`
+setting, or an `up --public`/`up --private` override, only changes basic auth.
 
-Only one environment may exist per project and exact branch. Internally each
-environment is keyed as `<project>--<branch slug>--<port>`; the port keeps
-branches whose slugs collide (`feature/foo`, `feature-foo`) distinct, and names
-the systemd unit, state files, Caddy route and database unambiguously.
+Only one environment may exist per project and exact branch. Generated
+artifacts use the descriptive key `<project>--<branch slug>--<id>`, including
+systemd units such as
+`dev-env@sample--worktree-silver-cloud-2a0f--epxrnilj.service`. The concise ID is
+the URL component and command-line selector.
 
 ## Setting up a machine
 
-Needs postgres, Caddy, and a wildcard DNS record pointing at the box.
+Needs postgres, Caddy, and one `*.<base domain>` wildcard DNS record pointing at
+the box.
 
 ```sh
 dev-env setup     # writes config.json, then re-run to write the Caddy config
@@ -58,12 +60,15 @@ installs the `dev-env@.service` systemd user template. Enable lingering so
 environments survive logout: `loginctl enable-linger $USER`.
 
 `config.json` is machine-local and gitignored — see `config.example.json`.
-Hostname identifiers are unbounded, so one certificate per hostname would grow
-issuance without limit; each project is instead served under one wildcard
-certificate obtained through DNS-01. `acme_dns_provider` (for example,
-`route53`) is therefore required, and the provider's credentials must be
-available to Caddy. `base_domain` is a setup-time choice; tear down
-environments and remove their managed Caddy sites before changing it.
+Environment IDs are unbounded in number, so one certificate per hostname would
+grow issuance without limit; every project is instead served under one shared
+`*.<base domain>` wildcard certificate obtained through DNS-01.
+`acme_dns_provider` (for example, `route53`) is therefore required, and the
+provider's module and credentials must be available to Caddy. Check the modules
+in the installed Caddy build with `caddy list-modules | grep '^dns\.providers\.'`.
+`base_domain` is a setup-time choice. When it changes, `dev-env setup` applies
+it automatically if no environments exist. If environments are recorded, run
+`dev-env down --all` and then `dev-env setup`.
 
 ## Existing worktrees
 
@@ -75,7 +80,7 @@ dev-env up feature-x                          # finds and adopts an existing che
 dev-env up feature-x --worktree ~/some/path   # or point at one explicitly
 ```
 
-Otherwise `up` creates a worktree as before, from the local branch, from
+When no checkout exists, `up` creates a worktree from the local branch, from
 `origin/<branch>`, or from `--base` when the branch is new.
 
 `down` removes a worktree only when `dev-env` created it. `git worktree remove
@@ -86,12 +91,6 @@ positive evidence of ownership rather than the absence of a reason to stop:
 | --- | --- |
 | it created the worktree | removes it, unless `--keep-worktree` |
 | it adopted the worktree | never removes it; no flag overrides this |
-| nothing — the environment predates ownership tracking | leaves it, unless `--remove-worktree` |
-
-That last row matters because older versions silently adopted a worktree already
-sitting at the default path, which is exactly where agents put theirs. Such an
-environment cannot prove the checkout is its own, so it leaves it behind and says
-so. Use `--remove-worktree` once you have checked.
 
 The `up` summary marks an adopted worktree.
 
@@ -110,7 +109,7 @@ Keys, all optional except `commands.server`:
 
 | Key | Purpose |
 | --- | --- |
-| `name` | Hostname component; defaults to the repository directory name |
+| `name` | Project component appended to each environment ID in its hostname; defaults to the repository directory name |
 | `public` | Set `true` to disable basic auth by default; defaults to `false` |
 | `subdomains` | Hostnames to serve, and which sit behind basic auth |
 | `commands` | `install`, `schema`, `migrate`, `server` |
@@ -142,9 +141,9 @@ wrapper; dev-env does not inspect arbitrary shell or script contents.
 
 ## Subdomains
 
-Every environment answers on the bare hostname and on `app.` unless the project
-says otherwise. `subdomains` replaces that list, and decides which hostnames sit
-behind basic auth:
+Every environment answers on the bare hostname and an `app-`-prefixed hostname
+unless the project says otherwise. `subdomains` replaces that list, and decides
+which hostnames sit behind basic auth:
 
 ```json
 "subdomains": {
@@ -167,8 +166,8 @@ override the project setting for one new environment. The choice is recorded on
 
 Caddy cannot vary basic auth between hostnames inside one site block, so guarded
 and open hostnames are routed separately. Subdomain labels are folded into the
-wildcard-covered leftmost label (`app-pkliinp6.project.example.com`) so the
-project's certificate covers them. Adding a subdomain to a project whose
+wildcard-covered leftmost label (`app-pkliinp6-project.example.com`) so the
+shared base-domain certificate covers them. Adding a subdomain to a project whose
 environments are already up takes effect on `dev-env warm`.
 
 ## Databases
@@ -212,27 +211,14 @@ existing environment's database from it. On MySQL the default dump is
 
 Let's Encrypt caps new certificates per registered domain per week, and
 randomized hostnames would each need one, so per-hostname issuance cannot work.
-Each project instead holds a single wildcard certificate for
-`*.<project>.<base domain>`, obtained through DNS-01, under which environments
-come and go freely: creating one adds a route, removing one deletes it, and
-neither touches issuance. Practical capacity is bounded by `port_range` and
-machine resources, not by a configured environment count.
+The machine instead holds a single wildcard certificate for `*.<base domain>`,
+obtained through DNS-01, under which every project's environments come and go
+freely: creating one adds a route, removing one deletes it, and neither touches
+issuance. Practical capacity is bounded by `port_range` and machine resources,
+not by a configured environment count.
 
 Basic-auth passwords live exactly as long as their environment record: created
 on `up`, stable across restarts, removed on `down`.
-
-## Migrating from the fixed-pool version
-
-There is no legacy-state detection or migration; the cut is clean:
-
-1. Use the old version to tear down each `devN` environment, passing
-   `--keep-worktree` where its checkout must remain.
-2. Remove old parked and exact-host managed Caddy files, old slot state and old
-   slot secrets.
-3. Configure wildcard DNS, Caddy's DNS provider module and provider credentials.
-4. Remove `pool_size` from `config.json` and rerun `dev-env setup`.
-5. Bring each desired branch up again — preserved worktrees are adopted
-   automatically — supplying `--id` only when a chosen hostname is wanted.
 
 ## Development
 

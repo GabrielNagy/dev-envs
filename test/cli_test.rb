@@ -21,14 +21,18 @@ class CLITest < Minitest::Test
     Dir.chdir(repo) { yield }
   end
 
-  def save_state(project:, branch:, port:, identifier:, **extra)
-    key = "#{project}--#{DevEnv::Util.slugify(branch)}--#{port}"
+  def save_state(project:, branch:, port:, id:, **extra)
+    key = "#{project}--#{DevEnv::Util.slugify(branch)}--#{id}"
     @store.save(key, {
-      "key" => key, "project" => project, "branch" => branch, "identifier" => identifier,
-      "domain" => "#{identifier}.#{project}.example.com", "port" => port,
-      "database" => "dev_env_#{project}_#{port}_#{identifier}", "worktree" => "/nowhere/#{key}",
+      "id" => id, "key" => key, "project" => project, "branch" => branch,
+      "domain" => "#{id}-#{project}.example.com", "port" => port,
+      "database" => "dev_env_#{project}_#{port}_#{id}", "databases" => ["dev_env_#{project}_#{port}_#{id}"],
+      "worktree" => "/nowhere/#{key}",
+      "project_root" => "/nowhere/#{project}",
       "worktree_owned" => false, "basic_auth" => true, "process_manager" => nil,
+      "after_down" => [],
     }.merge(extra))
+    @store.write_env(key, { "PORT" => port.to_s, "WORKTREE" => "/nowhere/#{key}" })
     key
   end
 
@@ -73,8 +77,24 @@ class CLITest < Minitest::Test
   def test_help_prints_usage
     out, = capture_io { @cli.start(["help"]) }
     assert_includes out, "Usage: dev-env <command>"
+    assert_includes out, "setup"
     assert_includes out, "up [branch]"
+    assert_includes out, "down --all"
     refute_match(/slot/i, out)
+  end
+
+  def test_base_domain_change_is_automatic_when_empty_and_requires_down_all_for_environments
+    File.write(File.join(@config.sites_dir, DevEnv::Caddy::WILDCARD_SITE), <<~CADDY)
+      # Managed by dev-env
+      https://*.other.net {
+      }
+    CADDY
+
+    @cli.send(:prepare_base_domain_change!) # no environments: setup may overwrite it
+
+    save_state(project: "proj", branch: "feature", port: 4001, id: "aaaaaaaa")
+    error = assert_raises(DevEnv::Error) { @cli.send(:prepare_base_domain_change!) }
+    assert_includes error.message, "dev-env down --all"
   end
 
   def test_unknown_command_exits_nonzero
@@ -110,7 +130,7 @@ class CLITest < Minitest::Test
   end
 
   def test_ls_is_an_alias_for_list
-    save_state(project: "proj", branch: "feature", port: 4000, identifier: "aaaaaaaa")
+    save_state(project: "proj", branch: "feature", port: 4000, id: "aaaaaaaa")
     @cli.send(:systemd).define_singleton_method(:status) { |_| "active" }
 
     list_out, = capture_io { @cli.start(["list"]) }
@@ -120,33 +140,33 @@ class CLITest < Minitest::Test
   end
 
   def test_list_shows_exactly_project_branch_port_status_url_for_any_number_of_environments
-    5.times { |n| save_state(project: "proj", branch: "branch-#{n}", port: 4000 + n, identifier: "id#{n}aaaa") }
+    5.times { |n| save_state(project: "proj", branch: "branch-#{n}", port: 4000 + n, id: "id#{n}aaaaa") }
     @cli.send(:systemd).define_singleton_method(:status) { |_| "inactive" }
 
     out, = capture_io { @cli.start(["list"]) }
     lines = out.lines.map(&:chomp).reject(&:empty?)
-    assert_equal %w[PROJECT BRANCH PORT STATUS URL], lines.first.split
+    assert_equal %w[ID PROJECT BRANCH PORT STATUS URL], lines.first.split
     assert_equal 6, lines.length # header + one row per environment, no free-slot footer
     refute_match(/free/i, out)
-    assert_includes out, "https://id0aaaa.proj.example.com"
+    assert_includes out, "https://id0aaaaa-proj.example.com"
   end
 
   def test_resolve_finds_state_by_exact_project_and_branch_despite_colliding_slugs
-    slashed = save_state(project: "proj", branch: "feature/foo", port: 4001, identifier: "aaaaaaaa")
-    dashed  = save_state(project: "proj", branch: "feature-foo", port: 4002, identifier: "bbbbbbbb")
-    other   = save_state(project: "zed", branch: "feature/zed", port: 4003, identifier: "cccccccc")
+    slashed = save_state(project: "proj", branch: "feature/foo", port: 4001, id: "aaaaaaaa")
+    dashed  = save_state(project: "proj", branch: "feature-foo", port: 4002, id: "bbbbbbbb")
+    other   = save_state(project: "zed", branch: "feature/zed", port: 4003, id: "cccccccc")
 
     in_project do
       assert_equal slashed, @cli.send(:resolve, "feature/foo")
       assert_equal dashed, @cli.send(:resolve, "feature-foo")
-      assert_equal other, @cli.send(:resolve, other), "a runtime key is accepted as-is"
+      assert_equal other, @cli.send(:resolve, "cccccccc"), "an environment ID is accepted as-is"
       error = assert_raises(DevEnv::Error) { @cli.send(:resolve, "feature/zed") }
       assert_includes error.message, "no environment"
     end
   end
 
   def test_up_rejects_a_second_environment_for_the_same_project_and_branch
-    save_state(project: "proj", branch: "feature", port: 4001, identifier: "aaaaaaaa")
+    save_state(project: "proj", branch: "feature", port: 4001, id: "aaaaaaaa")
     in_project do
       error = assert_raises(DevEnv::Error) { @cli.send(:cmd_up, ["feature"]) }
       assert_includes error.message, "already has an environment"
@@ -154,7 +174,7 @@ class CLITest < Minitest::Test
   end
 
   def test_up_infers_the_branch_from_the_current_checkout_when_omitted
-    save_state(project: "proj", branch: "feature", port: 4001, identifier: "aaaaaaaa")
+    save_state(project: "proj", branch: "feature", port: 4001, id: "aaaaaaaa")
     in_project do
       system("git", "checkout", "-q", "-b", "feature")
       error = assert_raises(DevEnv::Error) { @cli.send(:cmd_up, []) }
@@ -163,7 +183,12 @@ class CLITest < Minitest::Test
   end
 
   def test_up_uses_the_project_public_default
-    assert_equal true, up_state_for({})["basic_auth"]
+    private_state = up_state_for({})
+    assert_match(/\A[a-z0-9]{8}\z/, private_state["id"])
+    assert_equal "proj--feature--#{private_state['id']}", private_state["key"]
+    assert_equal "#{private_state['id']}-proj.example.com", private_state["domain"]
+    assert_equal "dev_env_proj_#{private_state['port']}_#{private_state['id']}", private_state["database"]
+    assert_equal true, private_state["basic_auth"]
     assert_equal false, up_state_for({ "public" => true })["basic_auth"]
   end
 
@@ -172,54 +197,29 @@ class CLITest < Minitest::Test
     assert_equal true, up_state_for({ "public" => true }, "--private")["basic_auth"]
   end
 
-  def test_id_validation_accepts_dns_labels_and_rejects_everything_else
-    in_project do
-      %w[pkliinp6 a a1 a-b 12345678 ab-cd-ef].each do |id|
-        assert_equal id, @cli.send(:validate_identifier!, id)
-      end
-      ["Pkliinp6", "a.b", "toolong9x", "-ab", "ab-", "", "a_b", "päx"].each do |id|
-        error = assert_raises(DevEnv::Error, "expected #{id.inspect} to be rejected") do
-          @cli.send(:validate_identifier!, id)
-        end
-        assert_includes error.message, "not a usable identifier"
-      end
-    end
-  end
-
-  def test_identifier_collisions_are_scoped_to_the_project
-    save_state(project: "proj", branch: "feature", port: 4001, identifier: "pkliinp6")
-    save_state(project: "zed", branch: "other", port: 4002, identifier: "qqqqqqqq")
-
-    in_project do
-      error = assert_raises(DevEnv::Error) { @cli.send(:validate_identifier!, "pkliinp6") }
-      assert_includes error.message, "already used by proj/feature"
-      # Another project's identifier may be reused here.
-      assert_equal "qqqqqqqq", @cli.send(:validate_identifier!, "qqqqqqqq")
-    end
-  end
-
-  def test_generated_identifiers_retry_recorded_collisions
-    save_state(project: "proj", branch: "feature", port: 4001, identifier: "aaaaaaaa")
+  def test_generated_ids_retry_recorded_collisions
+    save_state(project: "proj", branch: "feature", port: 4001, id: "aaaaaaaa")
     sequence = %w[aaaaaaaa bbbbbbbb]
-    @cli.define_singleton_method(:random_identifier) { sequence.shift }
-    in_project do
-      assert_equal "bbbbbbbb", @cli.send(:generate_identifier)
-      assert_empty sequence
-    end
+    @cli.define_singleton_method(:random_environment_id) { sequence.shift }
+
+    assert_equal "bbbbbbbb", @cli.send(:generate_environment_id)
+    assert_empty sequence
   end
 
   def test_up_summary_ends_with_the_total_duration
-    key = save_state(project: "proj", branch: "feature", port: 4001, identifier: "aaaaaaaa")
+    key = save_state(project: "proj", branch: "feature", port: 4001, id: "aaaaaaaa")
 
     in_project do
       out, = capture_io { @cli.send(:print_summary, key, total: 65) }
 
+      assert_includes out, "ID         aaaaaaaa"
+      assert_includes out, "dev-env down aaaaaaaa"
       assert out.rstrip.end_with?("Total      [1m 05s]"), out
     end
   end
 
   def test_down_removes_state_caddy_route_and_password
-    key = save_state(project: "proj", branch: "feature", port: 4001, identifier: "aaaaaaaa")
+    key = save_state(project: "proj", branch: "feature", port: 4001, id: "aaaaaaaa")
     secrets = DevEnv::Secrets.new(@config.secret_dir)
     secrets.password_for(key)
 
@@ -227,29 +227,67 @@ class CLITest < Minitest::Test
       route = @cli.send(:caddy).site_path(key)
       FileUtils.mkdir_p(File.dirname(route))
       File.write(route, "# Managed by dev-env\n")
-      @cli.send(:caddy).define_singleton_method(:reload) { nil }
+      @cli.send(:teardown_caddy).define_singleton_method(:reload) { nil }
       @cli.send(:systemd).define_singleton_method(:systemctl) { |*| true }
       @cli.send(:systemd).define_singleton_method(:configure_process_manager) { |*| nil }
       dropped = stub_database_drops
 
-      out, = capture_io { @cli.send(:cmd_down, ["feature"]) }
+      out, = capture_io { @cli.send(:cmd_down, ["aaaaaaaa"]) }
 
       refute @store.exist?(key)
       refute_path_exists route
       refute secrets.password?(key)
-      assert_equal ["dev_env_proj_4001_aaaaaaaa"], dropped, "a record without a database list drops its one database"
+      assert_equal ["dev_env_proj_4001_aaaaaaaa"], dropped
       assert_includes out, "proj/feature removed"
       refute_match(/kept for reuse|parking/i, out)
     end
   end
 
+  def test_down_does_not_accept_a_branch_as_an_explicit_target
+    key = save_state(project: "proj", branch: "feature", port: 4001, id: "aaaaaaaa")
+
+    in_project do
+      error = assert_raises(DevEnv::Error) { @cli.send(:cmd_down, ["feature"]) }
+
+      assert_includes error.message, "no environment \"feature\""
+      assert @store.exist?(key)
+    end
+  end
+
+  def test_down_all_removes_every_projects_active_or_inactive_environment_outside_a_repository
+    first = save_state(project: "proj", branch: "feature", port: 4001, id: "aaaaaaaa")
+    second = save_state(project: "zed", branch: "main", port: 4002, id: "bbbbbbbb")
+    File.write(File.join(@config.sites_dir, DevEnv::Caddy::WILDCARD_SITE), <<~CADDY)
+      # Managed by dev-env
+      https://*.other.net {
+      }
+    CADDY
+
+    units = []
+    @cli.send(:systemd).define_singleton_method(:systemctl) { |*args| units << args; true }
+    @cli.send(:systemd).define_singleton_method(:configure_process_manager) { |*| nil }
+    @cli.send(:teardown_caddy).define_singleton_method(:reload) { nil }
+    dropped = stub_database_drops
+    elsewhere = Dir.mktmpdir.tap { |dir| @tmp_dirs << dir }
+
+    out, = capture_io { Dir.chdir(elsewhere) { @cli.start(["down", "--all"]) } }
+
+    assert_empty @store.keys
+    assert_equal ["dev_env_proj_4001_aaaaaaaa", "dev_env_zed_4002_bbbbbbbb"], dropped.sort
+    assert_equal [first, second].sort,
+                 units.filter_map { |args| args.grep(String).filter_map { _1[/\Adev-env@(.+)\.service\z/, 1] }.first }.sort
+    assert_includes out, "proj/feature removed"
+    assert_includes out, "zed/main removed"
+    assert_includes out, "All environments removed"
+  end
+
   def test_down_infers_the_environment_from_the_current_worktree_when_omitted
     worktree = Dir.mktmpdir.tap { |d| @tmp_dirs << d }
-    key = save_state(project: "proj", branch: "feature", port: 4001, identifier: "aaaaaaaa",
+    key = save_state(project: "proj", branch: "feature", port: 4001, id: "aaaaaaaa",
                      "worktree" => worktree)
 
     in_project do
-      @cli.send(:caddy).define_singleton_method(:reload) { nil }
+      @cli.send(:teardown_caddy).define_singleton_method(:reload) { nil }
       @cli.send(:systemd).define_singleton_method(:systemctl) { |*| true }
       @cli.send(:systemd).define_singleton_method(:configure_process_manager) { |*| nil }
       stub_database_drops
@@ -262,38 +300,39 @@ class CLITest < Minitest::Test
   end
 
   def test_down_without_argument_outside_a_worktree_fails_with_usage
-    save_state(project: "proj", branch: "feature", port: 4001, identifier: "aaaaaaaa")
+    save_state(project: "proj", branch: "feature", port: 4001, id: "aaaaaaaa")
     in_project do
       error = assert_raises(DevEnv::Error) { @cli.send(:cmd_down, []) }
-      assert_includes error.message, "Usage: dev-env down [branch]"
+      assert_includes error.message, "Usage: dev-env down [id]"
     end
   end
 
   def test_down_drops_every_recorded_database_with_the_recorded_adapter
-    save_state(project: "proj", branch: "feature", port: 4001, identifier: "aaaaaaaa",
-               "databases" => ["dev_env_proj_4001_aaaaaaaa", "dev_env_proj_4001_aaaaaaaa_data_science"],
-               "database_settings" => { "adapter" => "mysql", "user" => "sample_dev" })
+    key = save_state(project: "proj", branch: "feature", port: 4001, id: "aaaaaaaa",
+                     "databases" => ["dev_env_proj_4001_aaaaaaaa", "dev_env_proj_4001_aaaaaaaa_data_science"],
+                     "database_settings" => { "adapter" => "mysql", "user" => "sample_dev" })
 
     in_project do
-      @cli.send(:caddy).define_singleton_method(:reload) { nil }
+      @cli.send(:teardown_caddy).define_singleton_method(:reload) { nil }
       @cli.send(:systemd).define_singleton_method(:systemctl) { |*| true }
       @cli.send(:systemd).define_singleton_method(:configure_process_manager) { |*| nil }
 
-      state = @store.load("proj--feature--4001")
+      state = @store.load(key)
       db = @cli.send(:database_for, state)
       assert_instance_of DevEnv::Database::MySQL, db, "the adapter comes from state, not the repository"
 
       dropped = stub_database_drops
-      capture_io { @cli.send(:cmd_down, ["feature"]) }
+      capture_io { @cli.send(:cmd_down, ["aaaaaaaa"]) }
       assert_equal ["dev_env_proj_4001_aaaaaaaa", "dev_env_proj_4001_aaaaaaaa_data_science"], dropped
     end
   end
 
   def test_down_runs_after_down_hooks_with_vars_and_keep_flags_and_survives_failures
-    key = save_state(project: "proj", branch: "feature", port: 4001, identifier: "aaaaaaaa")
+    key = save_state(project: "proj", branch: "feature", port: 4001, id: "aaaaaaaa",
+                     "after_down" => ["cleanup 4001 feature", "exit 1"])
 
     in_project("proj", "after_down" => ["cleanup ${PORT} ${BRANCH}", "exit 1"]) do
-      @cli.send(:caddy).define_singleton_method(:reload) { nil }
+      @cli.send(:teardown_caddy).define_singleton_method(:reload) { nil }
       @cli.send(:systemd).define_singleton_method(:systemctl) { |*| true }
       @cli.send(:systemd).define_singleton_method(:configure_process_manager) { |*| nil }
       stub_database_drops
@@ -303,7 +342,7 @@ class CLITest < Minitest::Test
         !cmd.join(" ").start_with?("exit") # the second hook fails
       end
 
-      out, err = capture_io { @cli.send(:cmd_down, ["feature", "--keep-worktree"]) }
+      out, err = capture_io { @cli.send(:cmd_down, ["aaaaaaaa", "--keep-worktree"]) }
 
       hook, kwargs = calls.find { |command,| command == "cleanup 4001 feature" }
       assert hook, "expected the interpolated hook to run, got: #{calls.map(&:first)}"
@@ -315,8 +354,8 @@ class CLITest < Minitest::Test
   end
 
   def test_warm_rewrites_only_recorded_environments_of_the_current_project
-    mine  = save_state(project: "proj", branch: "feature", port: 4001, identifier: "aaaaaaaa", "basic_auth" => false)
-    other = save_state(project: "zed", branch: "other", port: 4002, identifier: "bbbbbbbb", "basic_auth" => false)
+    mine  = save_state(project: "proj", branch: "feature", port: 4001, id: "aaaaaaaa", "basic_auth" => false)
+    other = save_state(project: "zed", branch: "other", port: 4002, id: "bbbbbbbb", "basic_auth" => false)
 
     in_project do
       @cli.send(:caddy).define_singleton_method(:reload) { nil }
@@ -324,8 +363,8 @@ class CLITest < Minitest::Test
 
       out, = capture_io { @cli.send(:cmd_warm, []) }
 
-      assert_path_exists File.join(@config.sites_dir, "proj.wildcard.caddy")
-      assert_path_exists File.join(@config.sites_dir, "proj", "#{mine}.caddy")
+      assert_path_exists File.join(@config.sites_dir, DevEnv::Caddy::WILDCARD_SITE)
+      assert_path_exists File.join(@config.sites_dir, DevEnv::Caddy::ROUTES_DIR, "#{mine}.caddy")
       refute_path_exists File.join(@config.sites_dir, "zed.wildcard.caddy")
       assert_empty Dir.glob(File.join(@config.sites_dir, "**", "#{other}.caddy"))
       assert_includes out, "Certificates warmed for proj"
@@ -333,19 +372,19 @@ class CLITest < Minitest::Test
   end
 
   def test_creds_without_argument_enumerates_the_projects_recorded_environments
-    key = save_state(project: "proj", branch: "feature", port: 4001, identifier: "aaaaaaaa")
-    save_state(project: "zed", branch: "other", port: 4002, identifier: "bbbbbbbb")
+    key = save_state(project: "proj", branch: "feature", port: 4001, id: "aaaaaaaa")
+    save_state(project: "zed", branch: "other", port: 4002, id: "bbbbbbbb")
     password = DevEnv::Secrets.new(@config.secret_dir).password_for(key)
 
     in_project do
       out, = capture_io { @cli.send(:cmd_creds, []) }
-      assert_includes out, "feature  https://aaaaaaaa.proj.example.com  dev / #{password}"
+      assert_includes out, "feature  https://aaaaaaaa-proj.example.com  dev / #{password}"
       refute_includes out, "bbbbbbbb"
     end
   end
 
   def test_creds_does_not_create_a_password_for_a_public_environment
-    key = save_state(project: "proj", branch: "feature", port: 4001, identifier: "aaaaaaaa", "basic_auth" => false)
+    key = save_state(project: "proj", branch: "feature", port: 4001, id: "aaaaaaaa", "basic_auth" => false)
     secrets = DevEnv::Secrets.new(@config.secret_dir)
 
     in_project do

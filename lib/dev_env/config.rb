@@ -30,12 +30,12 @@ module DevEnv
 
     # Environments get unbounded randomized hostnames, so per-hostname
     # certificates would grow issuance without limit; one DNS-01 wildcard
-    # certificate per project is required instead.
+    # certificate for the base domain is required instead.
     def acme_dns_provider
       provider = settings.fetch("acme_dns_provider", "").strip
       if provider.empty?
         raise Error, "acme_dns_provider is not set in #{path} — randomized hostnames need one " \
-                     "wildcard certificate per project, issued through a DNS-01 provider (e.g. \"route53\")"
+                     "wildcard certificate for the base domain, issued through a DNS-01 provider (e.g. \"route53\")"
       end
       provider
     end
