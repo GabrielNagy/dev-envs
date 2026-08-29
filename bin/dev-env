@@ -788,6 +788,29 @@ def resolve(slot_or_key)
   abort!("no environment #{slot_or_key.inspect} for #{project['name']} (try: dev-env list)")
 end
 
+# The environment whose worktree contains the current directory, so a command
+# run from inside a served checkout can leave the slot off. A shell entered
+# with `dev-env activate` counts too, even after cd'ing elsewhere.
+def implicit_key
+  here = File.realpath(Dir.pwd)
+  match = all_keys.filter_map do |key|
+    worktree = load_state(key)["worktree"].to_s
+    next if worktree.empty? || !Dir.exist?(worktree)
+    root = File.realpath(worktree)
+    [key, root] if here == root || here.start_with?(root + File::SEPARATOR)
+  end.max_by { |_, root| root.length }
+  return match.first if match
+  active = ENV["DEV_ENV_ACTIVE"].to_s
+  active unless active.empty? || !File.exist?(state_path(active))
+end
+
+# The explicit slot argument when given, otherwise the environment inferred
+# from the current directory. Option-like arguments (`logs -f`) are left alone.
+def resolve_target(argv, usage)
+  return resolve(argv.shift) if argv.first && !argv.first.start_with?("-")
+  implicit_key || abort!("#{usage}\n  no slot given, and #{Dir.pwd} is not inside an environment's worktree")
+end
+
 def cmd_down(argv)
   options = { worktree: true, database: true }
   parser = OptionParser.new do |o|
@@ -875,19 +898,19 @@ def cmd_creds(argv)
     return
   end
 
-  if argv.empty?
+  key = argv.empty? ? implicit_key : key_for(argv.shift)
+  if key.nil?
     pool.each do |slot|
-      key = key_for(slot)
-      next unless File.exist?(secret_path(key))
-      status = File.exist?(state_path(key)) ? "" : "  \e[90m(slot free)\e[0m"
-      domain = File.exist?(state_path(key)) ? load_state(key)["domain"] : domain_for(slot)
+      slot_key = key_for(slot)
+      next unless File.exist?(secret_path(slot_key))
+      status = File.exist?(state_path(slot_key)) ? "" : "  \e[90m(slot free)\e[0m"
+      domain = File.exist?(state_path(slot_key)) ? load_state(slot_key)["domain"] : domain_for(slot)
       host = host_for(domain, guarded.first["label"])
-      puts "#{slot}  https://#{host}  #{basic_auth_user} / #{password_for(key)}#{status}"
+      puts "#{slot}  https://#{host}  #{basic_auth_user} / #{password_for(slot_key)}#{status}"
     end
     return
   end
 
-  key = key_for(argv.shift)
   domain = load_state(key)["domain"]
   guarded.each_with_index do |sub, index|
     puts "#{index.zero? ? 'URLs' : ''.ljust(4)}     https://#{host_for(domain, sub['label'])}"
@@ -897,27 +920,78 @@ def cmd_creds(argv)
 end
 
 def cmd_logs(argv)
-  abort!("Usage: dev-env logs <slot> [-f]") if argv.empty?
-  key = resolve(argv.shift)
+  key = resolve_target(argv, "Usage: dev-env logs [slot] [-f]")
   exec("journalctl", "--user", "-u", unit(key), *argv)
 end
 
 def cmd_restart(argv)
-  abort!("Usage: dev-env restart <slot>") if argv.empty?
-  key = resolve(argv.shift)
+  key = resolve_target(argv, "Usage: dev-env restart [slot]")
   systemctl("restart", unit(key))
   ok(wait_for_boot(load_state(key)["port"]) ? "Restarted #{key}" : "Restarted #{key}, not answering yet")
+end
+
+# The environment file written on `up`, parsed back into a hash. It is the same
+# environment the service runs with, so commands run through `exec` and shells
+# activated with `activate` see exactly what the server sees.
+def saved_env(key)
+  abort!("no environment file for #{key.inspect} — bring it up first") unless File.exist?(env_path(key))
+  File.readlines(env_path(key)).filter_map do |line|
+    line = line.chomp
+    line.split("=", 2) unless line.empty?
+  end.to_h
+end
+
+def cmd_exec(argv)
+  command = nil
+  parser = OptionParser.new do |o|
+    o.banner = "Usage: dev-env exec [slot] -c \"command\""
+    o.on("-c COMMAND", "Command to run in the environment") { |v| command = v }
+  end
+  parser.parse!(argv)
+  abort!(parser.banner) if command.nil?
+  key = resolve_target(argv, parser.banner)
+  worktree = load_state(key)["worktree"]
+  system(saved_env(key), command, chdir: worktree)
+  exit($?.exitstatus || 1)
+end
+
+# True when this command was run inside an activated shell, as opposed to
+# exec'd in place of one. `exec` preserves the environment, so DEV_ENV_ACTIVE
+# alone cannot tell the two apart — but the parent process can: run inside the
+# activated shell, that shell is the parent; exec'd, its parent is ours.
+def nested_in_active_shell?
+  return false unless ENV["DEV_ENV_ACTIVE"]
+  File.read("/proc/#{Process.ppid}/environ").split("\0").any? { |v| v.start_with?("DEV_ENV_ACTIVE=") }
+rescue SystemCallError, IOError
+  true # cannot prove we were exec'd; refusing beats silently nesting
+end
+
+# Spawns an interactive shell in the environment's worktree with its env
+# applied — the pipenv/poetry/nix `shell` pattern. Leaving is just `exit`.
+# PATH is left alone: the saved one exists only because systemd starts units
+# with a minimal PATH, and an interactive shell already has a better one.
+def cmd_activate(argv)
+  key = resolve_target(argv, "Usage: dev-env activate [slot]")
+  if nested_in_active_shell?
+    # A child process cannot make its parent shell exit, so a shell started
+    # here could only nest inside the active one. Refuse instead.
+    abort!("already inside #{ENV['DEV_ENV_ACTIVE']} — `exit` first, or switch shells in place with `exec dev-env activate #{key}`")
+  end
+  state = load_state(key)
+  env = saved_env(key).except("PATH").merge("DEV_ENV_ACTIVE" => key)
+  ok "Entering #{key} (#{state['worktree']}) — exit to leave"
+  $stdout.flush # exec replaces the process before Ruby flushes buffered output
+  exec(env, ENV.fetch("SHELL", "/bin/sh"), chdir: state["worktree"])
 end
 
 def cmd_seed(argv)
   options = {}
   parser = OptionParser.new do |o|
-    o.banner = "Usage: dev-env seed <slot> [--seed PATH]"
+    o.banner = "Usage: dev-env seed [slot] [--seed PATH]"
     o.on("--seed PATH", "Dump to restore (default: #{default_dump})") { |v| options[:seed] = v }
   end
   parser.parse!(argv)
-  abort!(parser.banner) if argv.empty?
-  key = resolve(argv.shift)
+  key = resolve_target(argv, parser.banner)
   state = load_state(key)
   dump = options[:seed] || default_dump
   abort!("seed dump not found: #{dump}") unless File.exist?(dump)
@@ -996,10 +1070,16 @@ USAGE = <<~TEXT
     down <slot>       Tear an environment down and free its slot
     list              Show every environment, and this project's free slots
     creds [slot]      Show the basic-auth credentials
-    logs <slot> [-f]  Follow the log
-    restart <slot>    Restart the service
-    seed <slot>       Rebuild the database from the seed dump
+    logs [slot] [-f]  Follow the log
+    restart [slot]    Restart the service
+    exec [slot] -c "command"
+                      Run a command in the environment's worktree and env
+    activate [slot]   Open a shell in the environment's worktree and env; exit to leave
+    seed [slot]       Rebuild the database from the seed dump
     warm              Rewrite every slot's Caddy site and pre-issue certificates
+
+  Run from inside an environment's worktree, commands taking [slot] default
+  to that environment when the slot is omitted.
 
   Environments occupy a fixed per-project pool, served at
   per-slot HTTPS hostnames, with the subdomains and which of them sit behind
@@ -1020,6 +1100,8 @@ when "list"    then cmd_list(ARGV)
 when "creds"   then cmd_creds(ARGV)
 when "logs"    then cmd_logs(ARGV)
 when "restart" then cmd_restart(ARGV)
+when "exec"    then cmd_exec(ARGV)
+when "activate" then cmd_activate(ARGV)
 when "seed"    then cmd_seed(ARGV)
 when "warm"    then cmd_warm(ARGV)
 when nil, "-h", "--help", "help" then puts USAGE

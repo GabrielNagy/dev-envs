@@ -11,9 +11,14 @@ in front and fetches a Let's Encrypt certificate per hostname.
 dev-env up <branch>     # claim a free slot
 dev-env list            # what is running, and which slots are free
 dev-env creds [slot]    # basic-auth credentials
-dev-env logs <slot> -f  # follow the log
+dev-env logs [slot] -f  # follow the log
+dev-env exec [slot] -c "bin/rails db:migrate:status"  # run one command in its context
+dev-env activate [slot]   # open a shell in its worktree + env; exit to leave
 dev-env down <slot>     # tear down and free the slot
 ```
+
+Run from inside an environment's worktree, every command taking `[slot]`
+infers it from the current directory, so the argument can be omitted.
 
 Private environments are served at `https://dev<N>.<project>.<base domain>`,
 plus one hostname per subdomain the project declares — by default `app.`, so
