@@ -162,6 +162,16 @@ class CLITest < Minitest::Test
     end
   end
 
+  def test_up_summary_ends_with_the_total_duration
+    key = save_state(project: "proj", branch: "feature", port: 4001, identifier: "aaaaaaaa")
+
+    in_project do
+      out, = capture_io { @cli.send(:print_summary, key, total: 65) }
+
+      assert out.rstrip.end_with?("Total      [1m 05s]"), out
+    end
+  end
+
   def test_down_removes_state_caddy_route_and_password
     key = save_state(project: "proj", branch: "feature", port: 4001, identifier: "aaaaaaaa")
     secrets = DevEnv::Secrets.new(@config.secret_dir)

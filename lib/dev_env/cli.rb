@@ -52,11 +52,11 @@ module DevEnv
         end
         send("cmd_#{command}", argv)
       else
-        warn "Unknown command: #{command}\n\n#{USAGE}"
+        warn "#{color("Unknown command: #{command}", RED, stream: $stderr)}\n\n#{USAGE}"
         exit 1
       end
     rescue Error => error
-      warn "\e[31m✗\e[0m #{error.message}"
+      warn color("✗ #{error.message}", RED, stream: $stderr)
       exit 1
     end
 
@@ -125,6 +125,7 @@ module DevEnv
     # --------------------------------------------------------------------- up
 
     def cmd_up(argv)
+      started_at = monotonic_time
       options = { basic_auth: true, base: "origin/main" }
       parser = OptionParser.new do |o|
         o.banner = "Usage: dev-env up [branch] [options]"
@@ -214,6 +215,9 @@ module DevEnv
       ensure
         reservation.close unless reservation.closed?
       end
+
+      ok "#{project.name}/#{branch} is up"
+      print_summary(key, total: monotonic_time - started_at)
     end
 
     # ------------------------------------------------------------- lifecycle
@@ -288,10 +292,11 @@ module DevEnv
       headers = %w[PROJECT BRANCH PORT STATUS URL]
       widths = headers.each_with_index.map { |h, i| ([h] + rows.map { |r| r[i] }).map(&:length).max }
 
-      puts headers.each_with_index.map { |h, i| h.ljust(widths[i]) }.join("  ")
+      puts color(headers.each_with_index.map { |h, i| h.ljust(widths[i]) }.join("  "), BOLD)
       rows.each do |row|
         cells = row.each_with_index.map { |c, i| c.ljust(widths[i]) }
-        cells[3] = "#{row[3] == 'active' ? "\e[32m" : "\e[31m"}#{cells[3]}\e[0m"
+        cells[3] = color(cells[3], row[3] == "active" ? GREEN : RED)
+        cells[4] = color(cells[4], CYAN)
         puts cells.join("  ")
       end
     end
@@ -305,17 +310,19 @@ module DevEnv
         project_states.each do |state|
           next unless secrets.password?(state["key"])
           host = project.host_for(state["domain"], guarded.first["label"])
-          puts "#{state['branch']}  https://#{host}  #{@config.basic_auth_user} / #{secrets.password_for(state['key'])}"
+          puts "#{color(state['branch'], BOLD)}  #{color("https://#{host}", CYAN)}  " \
+               "#{@config.basic_auth_user} / #{color(secrets.password_for(state['key']), YELLOW)}"
         end
         return
       end
 
       domain = store.load(key)["domain"]
       guarded.each_with_index do |sub, index|
-        puts "#{index.zero? ? 'URLs' : ''.ljust(4)}     https://#{project.host_for(domain, sub['label'])}"
+        label = index.zero? ? "URLs" : "".ljust(4)
+        puts "#{color(label, BOLD)}     #{color("https://#{project.host_for(domain, sub['label'])}", CYAN)}"
       end
-      puts "Username #{@config.basic_auth_user}"
-      puts "Password #{secrets.password_for(key)}"
+      puts "#{color('Username', BOLD)} #{@config.basic_auth_user}"
+      puts "#{color('Password', BOLD)} #{color(secrets.password_for(key), YELLOW)}"
     end
 
     def cmd_logs(argv)
@@ -423,7 +430,7 @@ module DevEnv
             sleep 3
           end
           failed << host if code.to_i.zero?
-          puts(code.to_i.zero? ? "  \e[31m✗\e[0m #{host}" : "  \e[32m✓\e[0m #{host} (#{code})")
+          puts(code.to_i.zero? ? "  #{color('✗', RED)} #{host}" : "  #{color('✓', GREEN)} #{color(host, CYAN)} (#{code})")
         end
       end
 
@@ -550,8 +557,6 @@ module DevEnv
       systemd.systemctl("enable", "--now", systemd.unit(key))
 
       note "Not answering on 127.0.0.1:#{port} yet — check: dev-env logs #{branch} -f" unless wait_for_boot(port)
-      ok "#{project.name}/#{branch} is up"
-      print_summary(key)
     end
 
     def restore_dump(db, database, dump, worktree, app_env, vars)
@@ -581,21 +586,29 @@ module DevEnv
       false
     end
 
-    def print_summary(key)
+    def print_summary(key, total:)
       state = store.load(key)
       puts
       project.subdomains.each_with_index do |sub, index|
         label = index.zero? ? "URLs" : ""
-        open = state["basic_auth"] && !sub["auth"] ? "  \e[33m(no auth)\e[0m" : ""
-        puts "  #{label.ljust(10)} https://#{project.host_for(state['domain'], sub['label'])}#{open}"
+        open = state["basic_auth"] && !sub["auth"] ? "  #{color('(no auth)', YELLOW)}" : ""
+        url = "https://#{project.host_for(state['domain'], sub['label'])}"
+        puts "  #{color(label.ljust(10), BOLD)} #{color(url, CYAN)}#{open}"
       end
-      puts(state["basic_auth"] ? "  Basic auth #{@config.basic_auth_user} / #{secrets.password_for(key)}" : "  Basic auth \e[33mdisabled\e[0m")
-      puts "  Worktree   #{state['worktree']}#{state['worktree_owned'] ? '' : ' (adopted; kept on down)'}"
-      puts "  Database   #{databases_for(state).join(', ')}  (port #{state['port']})"
+      auth = if state["basic_auth"]
+               "#{@config.basic_auth_user} / #{color(secrets.password_for(key), YELLOW)}"
+             else
+               color("disabled", YELLOW)
+             end
+      adopted = state["worktree_owned"] ? "" : " #{color('(adopted; kept on down)', YELLOW)}"
+      puts "  #{color('Basic auth', BOLD)} #{auth}"
+      puts "  #{color('Worktree'.ljust(10), BOLD)} #{state['worktree']}#{adopted}"
+      puts "  #{color('Database'.ljust(10), BOLD)} #{databases_for(state).join(', ')}  (port #{state['port']})"
       puts
-      puts "  Logs       dev-env logs #{state['branch']} -f"
-      puts "  Tear down  dev-env down #{state['branch']}"
+      puts "  #{color('Logs'.ljust(10), BOLD)} #{color("dev-env logs #{state['branch']} -f", CYAN)}"
+      puts "  #{color('Tear down'.ljust(10), BOLD)} #{color("dev-env down #{state['branch']}", CYAN)}"
       puts
+      puts "  #{color('Total'.ljust(10), BOLD)} #{duration_tag(total)}"
     end
 
     # A branch names an environment by the exact `branch` recorded in state,

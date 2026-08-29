@@ -26,6 +26,10 @@ class UtilTest < Minitest::Test
     refute U.run("false", check: false, quiet: true)
     out, = capture_io { assert U.run("true") }
     assert_includes out, "$ true"
+    assert_match(/└─ done \[\d+(?:ms|(?:\.\d+)?s)\]/, out)
+
+    failed_out, = capture_io { refute U.run("false", check: false) }
+    assert_match(/└─ failed \[\d+(?:ms|(?:\.\d+)?s)\]/, failed_out)
   end
 
   def test_sh_runs_through_the_shell
@@ -37,5 +41,28 @@ class UtilTest < Minitest::Test
   def test_capture_strips_output_and_swallows_stderr
     assert_equal "hi", U.capture("echo", "hi")
     assert_equal "", U.capture("sh", "-c", "echo oops >&2")
+  end
+
+  def test_format_duration_uses_readable_units
+    assert_equal "125ms", U.format_duration(0.125)
+    assert_equal "1s", U.format_duration(1.0)
+    assert_equal "1.3s", U.format_duration(1.26)
+    assert_equal "1m 05s", U.format_duration(65)
+    assert_equal "1h 02m 03s", U.format_duration(3_723)
+  end
+
+  def test_color_is_limited_to_terminals_and_honors_no_color
+    terminal = Object.new
+    terminal.define_singleton_method(:tty?) { true }
+    redirected = Object.new
+    redirected.define_singleton_method(:tty?) { false }
+    previous = ENV.delete("NO_COLOR")
+
+    assert_equal "\e[36mhello\e[0m", U.color("hello", U::CYAN, stream: terminal)
+    assert_equal "hello", U.color("hello", U::CYAN, stream: redirected)
+    ENV["NO_COLOR"] = "1"
+    assert_equal "hello", U.color("hello", U::CYAN, stream: terminal)
+  ensure
+    previous ? ENV["NO_COLOR"] = previous : ENV.delete("NO_COLOR")
   end
 end

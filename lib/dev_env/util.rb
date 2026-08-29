@@ -10,14 +10,57 @@ module DevEnv
     # so keep it to the intersection of what all three accept.
     MAX_LABEL = 40
 
-    def step(message) = puts("\e[36m→\e[0m #{message}")
-    def ok(message)   = puts("\e[32m✓\e[0m #{message}")
-    def note(message) = warn("\e[33m!\e[0m #{message}")
+    BOLD    = "1"
+    MUTED   = "90"
+    RED     = "31"
+    GREEN   = "32"
+    YELLOW  = "33"
+    MAGENTA = "35"
+    CYAN    = "36"
+
+    def color(message, code, stream: $stdout)
+      return message if ENV.key?("NO_COLOR") || !stream.tty?
+
+      "\e[#{code}m#{message}\e[0m"
+    end
+
+    def step(message) = puts("#{color('→', CYAN)} #{color(message, BOLD)}")
+    def ok(message)   = puts(color("✓ #{message}", GREEN))
+    def note(message) = warn(color("! #{message}", YELLOW, stream: $stderr))
+
+    def monotonic_time = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+
+    def format_duration(seconds)
+      return "#{(seconds * 1_000).round}ms" if seconds < 1
+
+      if seconds < 60
+        rounded = seconds.round(1)
+        return "#{rounded == rounded.to_i ? rounded.to_i : rounded}s"
+      end
+
+      total = seconds.round
+      hours, remainder = total.divmod(3_600)
+      minutes, remaining_seconds = remainder.divmod(60)
+      return format("%dh %02dm %02ds", hours, minutes, remaining_seconds) if hours.positive?
+
+      format("%dm %02ds", minutes, remaining_seconds)
+    end
+
+    def duration_tag(seconds) = color("[#{format_duration(seconds)}]", MAGENTA)
 
     def run(*cmd, chdir: nil, env: {}, check: true, quiet: false)
-      puts "  \e[90m$ #{cmd.join(' ')}\e[0m" unless quiet
+      started_at = monotonic_time
+      puts "  #{color("$ #{cmd.join(' ')}", MUTED)}" unless quiet
       options = chdir ? { chdir: chdir } : {}
-      success = system(env, *cmd, **options)
+      success = nil
+      begin
+        success = system(env, *cmd, **options)
+      ensure
+        unless quiet
+          status = success ? color("done", GREEN) : color("failed", RED)
+          puts "  #{color('└─', MUTED)} #{status} #{duration_tag(monotonic_time - started_at)}"
+        end
+      end
       raise Error, "command failed: #{cmd.join(' ')}" if check && !success
       success
     end
