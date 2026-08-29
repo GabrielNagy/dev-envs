@@ -152,6 +152,7 @@ module DevEnv
         # Only a worktree this command created may be torn down by it, on rollback or on `down`.
         "worktree_owned" => !Dir.exist?(worktree),
         "basic_auth" => options[:basic_auth] && project.subdomains.any? { |sub| sub["auth"] },
+        "process_manager" => project.process_manager,
         "created_at" => Time.now.utc.iso8601,
       }
 
@@ -182,6 +183,7 @@ module DevEnv
       rescue StandardError => error
         note "Failed partway through — rolling back"
         rollback.reverse_each { |undo| undo.call rescue nil }
+        systemd.configure_process_manager(key, nil)
         store.delete(key)
         caddy.delete_site(key)
         raise error
@@ -203,6 +205,7 @@ module DevEnv
       key = resolve(argv.shift)
       state = store.load(key)
 
+      systemd.configure_process_manager(key, process_manager_for(state))
       step "Stopping #{systemd.unit(key)}"
       systemd.systemctl("disable", "--now", systemd.unit(key), check: false)
 
@@ -237,6 +240,7 @@ module DevEnv
              "an adopted checkout. Remove it yourself, or re-run with --remove-worktree."
       end
 
+      systemd.configure_process_manager(key, nil)
       store.delete(key)
       ok "#{state['project']}/#{state['slot']} removed (password kept for reuse)"
     end
@@ -298,8 +302,10 @@ module DevEnv
 
     def cmd_restart(argv)
       key = resolve_target(argv, "Usage: dev-env restart [slot]")
+      state = store.load(key)
+      systemd.configure_process_manager(key, process_manager_for(state))
       systemd.systemctl("restart", systemd.unit(key))
-      ok(wait_for_boot(store.load(key)["port"]) ? "Restarted #{key}" : "Restarted #{key}, not answering yet")
+      ok(wait_for_boot(state["port"]) ? "Restarted #{key}" : "Restarted #{key}, not answering yet")
     end
 
     def cmd_exec(argv)
@@ -351,6 +357,7 @@ module DevEnv
       vars = project.vars_for(state)
       app_env = project.app_env_for(vars)
 
+      systemd.configure_process_manager(key, process_manager_for(state))
       step "Stopping #{systemd.unit(key)} while the database is rebuilt"
       systemd.systemctl("stop", systemd.unit(key), check: false)
 
@@ -411,6 +418,7 @@ module DevEnv
     def caddy    = @caddy    ||= Caddy.new(@config, project: project)
     def worktrees = @worktrees ||= Worktrees.new(project)
     def systemd   = @systemd   ||= Systemd.new(unit_path: @config.unit_path, env_dir: @config.state_dir, run_dir: @config.run_dir)
+    def process_manager_for(state) = state.fetch("process_manager") { project.process_manager }
 
     # A fixed pool bounds certificate issuance: each slot's hostnames are
     # issued once and thereafter only renewed, and renewals do not count
@@ -462,6 +470,7 @@ module DevEnv
       step "Writing configuration"
       store.write_env(key, app_env)
       store.write_launcher(key, worktree, commands.fetch("server") { raise Error, "no commands.server in .dev-env.json" })
+      systemd.configure_process_manager(key, state["process_manager"])
       caddy.ensure_wildcard_site
       caddy.write_site(key, domain, port, password)
       store.save(key, state)

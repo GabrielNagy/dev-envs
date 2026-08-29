@@ -20,6 +20,12 @@ class ProjectTest < Minitest::Test
     assert_equal File.join(@config.dump_dir, "my-app-seed.pdump"), project.default_dump
   end
 
+  def test_process_manager
+    assert_nil build_project(@config).process_manager
+    assert_equal "overmind", build_project(@config, { "process_manager" => "overmind" }).process_manager
+    assert_equal "foreman", build_project(@config, { "process_manager" => "foreman" }).process_manager
+  end
+
   def test_subdomains_defaults_shorthand_and_validation
     assert_equal [{ "label" => "", "auth" => true }, { "label" => "app", "auth" => true }],
                  build_project(@config).subdomains
@@ -51,6 +57,7 @@ class ProjectTest < Minitest::Test
     env = project.app_env_for(vars)
     assert_equal "app.dev1.proj.example.com", env["HOST"]
     assert_equal "4001", env["PORT"]
+    assert_equal "/wt", env["WORKTREE"]
     assert_includes env["PATH"], "/usr/bin"
   end
 

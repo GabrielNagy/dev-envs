@@ -38,10 +38,11 @@ module DevEnv
 
     def name = @name ||= slugify(@settings["name"] || File.basename(root))
 
-    def commands       = @settings["commands"] || {}
-    def after_restore  = Array(@settings["after_restore"])
-    def link_from_root = Array(@settings["link_from_root"])
-    def worktree_files = @settings["worktree_files"] || {}
+    def commands        = @settings["commands"] || {}
+    def process_manager = @settings["process_manager"]
+    def after_restore   = Array(@settings["after_restore"])
+    def link_from_root  = Array(@settings["link_from_root"])
+    def worktree_files  = @settings["worktree_files"] || {}
 
     # Worktrees sit in a container folder beside the checkout, never loose in
     # the parent directory.
@@ -128,6 +129,7 @@ module DevEnv
       {
         "DATABASE_URL" => vars["DATABASE_URL"],
         "PORT" => vars["PORT"],
+        "WORKTREE" => vars["WORKTREE"],
         "PATH" => "#{File.expand_path('~/.local/bin')}:/usr/local/bin:/usr/bin:/bin",
       }.merge(interpolate(@settings["env"] || {}, vars))
     end

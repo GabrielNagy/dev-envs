@@ -19,6 +19,8 @@ module DevEnv
 
     def installed? = File.exist?(@unit_path)
 
+    def configure_process_manager(key, manager) = configure_overmind(key, enabled: manager == "overmind")
+
     def install
       FileUtils.mkdir_p(File.dirname(@unit_path))
       File.write(@unit_path, <<~UNIT)
@@ -43,6 +45,30 @@ module DevEnv
         [Install]
         WantedBy=default.target
       UNIT
+      systemctl("daemon-reload")
+    end
+
+    private
+
+    def configure_overmind(key, enabled:)
+      path = File.join(File.dirname(@unit_path), "#{unit(key)}.d", "dev-env-overmind.conf")
+      if enabled
+        content = <<~UNIT
+          [Service]
+          KillMode=mixed
+          ExecStopPost=-/bin/sh -c 'rm -f "$WORKTREE/.overmind.sock"'
+        UNIT
+        return if File.exist?(path) && File.read(path) == content
+
+        FileUtils.mkdir_p(File.dirname(path))
+        File.write(path, content)
+      else
+        return unless File.exist?(path)
+
+        FileUtils.rm_f(path)
+        directory = File.dirname(path)
+        Dir.rmdir(directory) if Dir.empty?(directory)
+      end
       systemctl("daemon-reload")
     end
   end

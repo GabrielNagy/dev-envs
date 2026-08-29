@@ -92,6 +92,7 @@ Keys, all optional except `commands.server`:
 | `name` | Hostname component; defaults to the repository directory name |
 | `subdomains` | Hostnames to serve, and which sit behind basic auth |
 | `commands` | `install`, `schema`, `migrate`, `server` |
+| `process_manager` | Set to `overmind` when `commands.server` delegates to Overmind |
 | `env` | Environment variables for those commands and the service |
 | `after_restore` | Commands to run after a dump is restored |
 | `link_from_root` | Globs symlinked from the primary checkout into each worktree, for gitignored files such as credential keys |
@@ -102,6 +103,10 @@ Keys, all optional except `commands.server`:
 `${SLOT}`, `${PROJECT}`, `${WORKTREE}` and `${TLD_LENGTH}` are interpolated, as
 are `${<SUB>_DOMAIN}` and `${<SUB>_DOMAIN_RE}` for each declared subdomain — an
 `mcp` subdomain gives `${MCP_DOMAIN}` and `${MCP_DOMAIN_RE}`.
+
+`"process_manager": "overmind"` installs Overmind's shutdown handling only for
+that environment's systemd unit. Set it even when `commands.server` invokes a
+wrapper; dev-env does not inspect arbitrary shell or script contents.
 
 ## Subdomains
 
