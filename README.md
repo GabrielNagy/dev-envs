@@ -147,3 +147,8 @@ placeholder Caddy site behind so renewal continues while it is idle.
 
 Basic-auth passwords are per slot and persist across teardown, so credentials
 saved in a browser keep working when a slot is reused.
+
+## Development
+
+`bin/dev-env` is a thin entry point; the implementation lives in `lib/dev_env/`,
+one class per responsibility. Run the tests with `rake test`.
