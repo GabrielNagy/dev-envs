@@ -33,6 +33,15 @@ class ProjectTest < Minitest::Test
     assert_equal "dev_env_#{'a' * 40}_65535_abcd_efg", database
   end
 
+  def test_database_adapter_shapes_dump_name_and_database_url
+    project = build_project(@config, { "name" => "proj", "database" => { "adapter" => "mysql", "user" => "sample_dev" } })
+    assert_equal File.join(@config.dump_dir, "proj-seed.sql"), project.default_dump
+
+    state = { "domain" => "pkliinp6.proj.example.com", "port" => 4001, "database" => "db",
+              "branch" => "x", "project" => "proj", "worktree" => "/wt" }
+    assert_equal "mysql2://sample_dev@127.0.0.1:3306/db", project.vars_for(state)["DATABASE_URL"]
+  end
+
   def test_process_manager
     assert_nil build_project(@config).process_manager
     assert_equal "overmind", build_project(@config, { "process_manager" => "overmind" }).process_manager

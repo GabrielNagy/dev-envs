@@ -169,8 +169,12 @@ module DevEnv
           "worktree_owned" => !Dir.exist?(worktree),
           "basic_auth" => options[:basic_auth] && project.subdomains.any? { |sub| sub["auth"] },
           "process_manager" => project.process_manager,
+          "database_settings" => project.database_settings,
           "created_at" => Time.now.utc.iso8601,
         }
+        # The primary plus any the project declares as extra, resolved here so
+        # `down` drops exactly what `up` created even if .dev-env.json changes.
+        state["databases"] = [database, *project.database.extra_names(project.vars_for(state))]
 
         FileUtils.mkdir_p([@config.state_dir, @config.run_dir, project.worktree_root])
         systemd.install unless systemd.installed?
@@ -188,12 +192,13 @@ module DevEnv
           end
           worktrees.write_files(worktree, state["domain"])
 
-          step "Creating database #{database}"
-          if capture("psql", "-tAc", "SELECT 1 FROM pg_database WHERE datname = '#{database}'") == "1"
-            raise Error, "database #{database} already exists"
+          db = database_for(state)
+          state["databases"].each do |name|
+            step "Creating database #{name}"
+            raise Error, "database #{name} already exists" if db.exists?(name)
+            db.create(name)
+            rollback << -> { db.drop(name, quiet: true) }
           end
-          run("createdb", database)
-          rollback << -> { run("dropdb", "--if-exists", database, check: false, quiet: true) }
 
           build_environment(state, seed, options, reservation)
         rescue StandardError => error
@@ -218,7 +223,7 @@ module DevEnv
         o.banner = "Usage: dev-env down <branch> [options]"
         o.on("--keep-worktree", "Leave the git worktree in place") { options[:worktree] = false }
         o.on("--remove-worktree", "Remove a worktree whose origin predates ownership tracking") { options[:force_worktree] = true }
-        o.on("--keep-database", "Leave the postgres database in place") { options[:database] = false }
+        o.on("--keep-database", "Leave the database in place") { options[:database] = false }
       end
       parser.parse!(argv)
       raise Error, parser.banner if argv.empty?
@@ -238,8 +243,11 @@ module DevEnv
       caddy.reload
 
       if options[:database]
-        step "Dropping database #{state['database']}"
-        run("dropdb", "--if-exists", state["database"], check: false)
+        db = database_for(state)
+        databases_for(state).each do |name|
+          step "Dropping database #{name}"
+          db.drop(name)
+        end
       end
 
       # `remove --force` discards uncommitted work and cannot be undone, so removal requires positive
@@ -376,10 +384,13 @@ module DevEnv
       step "Stopping #{systemd.unit(key)} while the database is rebuilt"
       systemd.systemctl("stop", systemd.unit(key), check: false)
 
-      step "Recreating #{state['database']}"
-      run("dropdb", "--if-exists", state["database"])
-      run("createdb", state["database"])
-      restore_dump(state["database"], dump, state["worktree"], app_env, vars)
+      db = database_for(state)
+      step "Recreating #{databases_for(state).join(', ')}"
+      databases_for(state).each do |name|
+        db.drop(name)
+        db.create(name)
+      end
+      restore_dump(db, state["database"], dump, state["worktree"], app_env, vars)
 
       project_command(interpolate(project.commands, vars)["migrate"], "Running migrations", state["worktree"], app_env)
 
@@ -429,6 +440,11 @@ module DevEnv
     def worktrees = @worktrees ||= Worktrees.new(project)
     def systemd   = @systemd   ||= Systemd.new(unit_path: @config.unit_path, env_dir: @config.state_dir, run_dir: @config.run_dir)
     def process_manager_for(state) = state.fetch("process_manager") { project.process_manager }
+
+    # Adapter and database list are recorded at `up`; environments from before
+    # adapters carry neither and were always postgres with one database.
+    def database_for(state)  = Database.for(state["database_settings"])
+    def databases_for(state) = state["databases"] || [state["database"]]
 
     # Project-defined teardown, mirroring after_restore. Runs after the service
     # stops and before anything is removed, so hooks still see the worktree,
@@ -504,7 +520,7 @@ module DevEnv
       end
 
       if seed
-        restore_dump(database, seed, worktree, app_env, vars)
+        restore_dump(database_for(state), database, seed, worktree, app_env, vars)
       else
         project_command(commands["schema"], "Loading schema", worktree, app_env)
       end
@@ -538,9 +554,9 @@ module DevEnv
       print_summary(key)
     end
 
-    def restore_dump(database, dump, worktree, app_env, vars)
+    def restore_dump(db, database, dump, worktree, app_env, vars)
       step "Restoring #{dump} into #{database}"
-      run("pg_restore", "--no-owner", "--no-acl", "-d", database, dump, check: false)
+      db.restore(database, dump)
 
       project.after_restore.each { |command| sh(interpolate(command, vars), chdir: worktree, env: app_env) }
     end
@@ -575,7 +591,7 @@ module DevEnv
       end
       puts(state["basic_auth"] ? "  Basic auth #{@config.basic_auth_user} / #{secrets.password_for(key)}" : "  Basic auth \e[33mdisabled\e[0m")
       puts "  Worktree   #{state['worktree']}#{state['worktree_owned'] ? '' : ' (adopted; kept on down)'}"
-      puts "  Database   #{state['database']}  (port #{state['port']})"
+      puts "  Database   #{databases_for(state).join(', ')}  (port #{state['port']})"
       puts
       puts "  Logs       dev-env logs #{state['branch']} -f"
       puts "  Tear down  dev-env down #{state['branch']}"

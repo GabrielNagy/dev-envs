@@ -4,8 +4,9 @@ Run a project's branches on a box and browse them over HTTPS, so a change can be
 clicked through in a real browser rather than only asserted about in tests.
 
 An environment is created on demand for one branch, bundling a git worktree, a
-postgres database, a loopback port and a systemd user unit. Caddy terminates TLS
-in front through one wildcard certificate per project.
+database (postgres by default, MariaDB/MySQL on request), a loopback port and a
+systemd user unit. Caddy terminates TLS in front through one wildcard
+certificate per project.
 
 ```
 dev-env up <branch>     # create an environment
@@ -112,6 +113,7 @@ Keys, all optional except `commands.server`:
 | `subdomains` | Hostnames to serve, and which sit behind basic auth |
 | `commands` | `install`, `schema`, `migrate`, `server` |
 | `process_manager` | Set to `overmind` when `commands.server` delegates to Overmind |
+| `database` | Engine and connection: `adapter`, `host`, `port`, `user`, `extra` |
 | `env` | Environment variables for those commands and the service |
 | `after_restore` | Commands to run after a dump is restored |
 | `after_down` | Commands run by `down` after the service stops, before anything is removed |
@@ -164,11 +166,42 @@ wildcard-covered leftmost label (`app-pkliinp6.project.example.com`) so the
 project's certificate covers them. Adding a subdomain to a project whose
 environments are already up takes effect on `dev-env warm`.
 
+## Databases
+
+Each environment gets one postgres database by default, created on `up` and
+dropped on `down`. A project on MariaDB or MySQL declares it:
+
+```json
+"database": {
+  "adapter": "mysql",
+  "user": "sample_dev",
+  "extra": ["${DATABASE}_data_science"]
+}
+```
+
+`adapter` is `postgres` (the default) or `mysql` (alias `mariadb`). The adapter
+decides how databases are created, dropped and restored, and what the default
+`${DATABASE_URL}` looks like — `postgresql:///…` or `mysql2://…`; a project
+wanting other query options overrides `DATABASE_URL` in `env`. The MySQL client
+connects over TCP to `host` (default `127.0.0.1`) and `port` (default `3306`)
+as `user` when given, so create/drop reach the same server the URL names.
+
+`extra` lists additional databases the environment owns, interpolated like
+commands — `${DATABASE}` is the primary's name. They are created by `up`,
+recreated by `seed` and dropped by `down` together with the primary, so a
+project needing a second database does not have to create it in `install` and
+clean it up by hand. Seed dumps restore into the primary only.
+
+The adapter and the database list are recorded in the environment's state at
+`up`, so `down` works outside the repository and is unaffected by later
+`.dev-env.json` edits.
+
 ## Seed data
 
 `dev-env up` restores `~/dev-envs/dumps/<project>-seed.pdump` if present, and
 starts from a bare schema otherwise. `dev-env seed <branch>` rebuilds an
-existing environment's database from it.
+existing environment's database from it. On MySQL the default dump is
+`<project>-seed.sql` — plain SQL, as `mysqldump` writes it.
 
 ## Certificates and capacity
 

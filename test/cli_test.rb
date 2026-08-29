@@ -32,6 +32,19 @@ class CLITest < Minitest::Test
     key
   end
 
+  # Replaces the adapter's subprocesses so no test touches a real database
+  # server; returns the list of dropped names.
+  def stub_database_drops
+    dropped = []
+    real = @cli.method(:database_for)
+    @cli.define_singleton_method(:database_for) do |state|
+      real.call(state).tap do |db|
+        db.define_singleton_method(:drop) { |name, **| dropped << name }
+      end
+    end
+    dropped
+  end
+
   def test_help_prints_usage
     out, = capture_io { @cli.start(["help"]) }
     assert_includes out, "Usage: dev-env <command>"
@@ -152,15 +165,36 @@ class CLITest < Minitest::Test
       @cli.send(:caddy).define_singleton_method(:reload) { nil }
       @cli.send(:systemd).define_singleton_method(:systemctl) { |*| true }
       @cli.send(:systemd).define_singleton_method(:configure_process_manager) { |*| nil }
-      @cli.define_singleton_method(:run) { |*, **| true } # swallow dropdb
+      dropped = stub_database_drops
 
       out, = capture_io { @cli.send(:cmd_down, ["feature"]) }
 
       refute @store.exist?(key)
       refute_path_exists route
       refute secrets.password?(key)
+      assert_equal ["dev_env_proj_4001_aaaaaaaa"], dropped, "a record without a database list drops its one database"
       assert_includes out, "proj/feature removed"
       refute_match(/kept for reuse|parking/i, out)
+    end
+  end
+
+  def test_down_drops_every_recorded_database_with_the_recorded_adapter
+    save_state(project: "proj", branch: "feature", port: 4001, identifier: "aaaaaaaa",
+               "databases" => ["dev_env_proj_4001_aaaaaaaa", "dev_env_proj_4001_aaaaaaaa_data_science"],
+               "database_settings" => { "adapter" => "mysql", "user" => "sample_dev" })
+
+    in_project do
+      @cli.send(:caddy).define_singleton_method(:reload) { nil }
+      @cli.send(:systemd).define_singleton_method(:systemctl) { |*| true }
+      @cli.send(:systemd).define_singleton_method(:configure_process_manager) { |*| nil }
+
+      state = @store.load("proj--feature--4001")
+      db = @cli.send(:database_for, state)
+      assert_instance_of DevEnv::Database::MySQL, db, "the adapter comes from state, not the repository"
+
+      dropped = stub_database_drops
+      capture_io { @cli.send(:cmd_down, ["feature"]) }
+      assert_equal ["dev_env_proj_4001_aaaaaaaa", "dev_env_proj_4001_aaaaaaaa_data_science"], dropped
     end
   end
 
@@ -171,6 +205,7 @@ class CLITest < Minitest::Test
       @cli.send(:caddy).define_singleton_method(:reload) { nil }
       @cli.send(:systemd).define_singleton_method(:systemctl) { |*| true }
       @cli.send(:systemd).define_singleton_method(:configure_process_manager) { |*| nil }
+      stub_database_drops
       calls = []
       @cli.define_singleton_method(:run) do |*cmd, **kwargs|
         calls << [cmd.join(" "), kwargs]

@@ -39,6 +39,10 @@ module DevEnv
     def name = @name ||= slugify(@settings["name"] || File.basename(root))
 
     def commands        = @settings["commands"] || {}
+    # Recorded into each environment's state at `up`, so `down` can rebuild
+    # the same adapter without reaching the repository's .dev-env.json.
+    def database_settings = @settings["database"]
+    def database          = @database ||= Database.for(database_settings)
     def process_manager = @settings["process_manager"]
     def after_restore   = Array(@settings["after_restore"])
     def after_down      = Array(@settings["after_down"])
@@ -59,10 +63,11 @@ module DevEnv
     def domain_for(identifier) = "#{identifier}.#{name}.#{@config.base_domain}"
 
     # "dev_env_" plus a 40-character name, a 5-digit port and an 8-character
-    # identifier is exactly PostgreSQL's 63-byte identifier limit.
+    # identifier is exactly PostgreSQL's 63-byte identifier limit (MySQL
+    # allows 64).
     def database_for(port, identifier) = "dev_env_#{name.tr('-', '_')}_#{port}_#{identifier.tr('-', '_')}"
 
-    def default_dump = File.join(@config.dump_dir, @settings["seed"] || "#{name}-seed.pdump")
+    def default_dump = File.join(@config.dump_dir, @settings["seed"] || "#{name}-seed#{database.dump_extension}")
 
     # The hostnames one environment answers on. A project declares them as
     # {"": {"auth": true}, "mcp": {"auth": false}}; a bare true or false is
@@ -124,7 +129,7 @@ module DevEnv
       domain_vars(state["domain"]).merge(
         "PORT" => state["port"].to_s, "DATABASE" => state["database"],
         "BRANCH" => state["branch"], "PROJECT" => state["project"], "WORKTREE" => state["worktree"],
-        "DATABASE_URL" => "postgresql:///#{state['database']}",
+        "DATABASE_URL" => database.url(state["database"]),
       )
     end
 
