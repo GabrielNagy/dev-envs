@@ -15,7 +15,7 @@ dev-env creds [branch]  # basic-auth credentials
 dev-env logs [branch] -f  # follow the log
 dev-env exec [branch] -c "bin/rails db:migrate:status"  # run one command in its context
 dev-env activate [branch]  # open a shell in its worktree + env; exit to leave
-dev-env down <branch>   # tear the environment down
+dev-env down [branch]   # tear the environment down
 ```
 
 Run from inside an environment's worktree, every command taking `[branch]`

@@ -15,8 +15,8 @@ module DevEnv
         setup             Detect the public address, write the Caddy config and unit
       Per project (run inside its repository):
         init              Write a starter .dev-env.json
-        up <branch>       Create an environment: worktree, database and service
-        down <branch>     Tear an environment down
+        up [branch]       Create an environment: worktree, database and service
+        down [branch]     Tear an environment down
         list              Show every environment
         creds [branch]    Show the basic-auth credentials
         logs [branch] [-f]
@@ -29,7 +29,8 @@ module DevEnv
         warm              Rewrite recorded Caddy sites and pre-issue certificates
 
       Run from inside an environment's worktree, commands taking [branch] default
-      to that environment when the branch is omitted.
+      to that environment when the branch is omitted. `up` defaults to the branch
+      checked out in the current directory.
 
       Environments are created on demand, each served at an HTTPS hostname whose
       leftmost label is a random identifier (or one chosen with `up --id`), with
@@ -126,7 +127,7 @@ module DevEnv
     def cmd_up(argv)
       options = { basic_auth: true, base: "origin/main" }
       parser = OptionParser.new do |o|
-        o.banner = "Usage: dev-env up <branch> [options]"
+        o.banner = "Usage: dev-env up [branch] [options]"
         o.on("--id ID", "Hostname identifier: a lowercase DNS label of at most 8 characters (default: random)") { |v| options[:id] = v }
         o.on("--seed PATH", "Dump to restore (default: #{project.default_dump})") { |v| options[:seed] = v; options[:seed_given] = true }
         o.on("--no-seed", "Skip the dump; build the schema from migrations") { options[:no_seed] = true }
@@ -135,8 +136,8 @@ module DevEnv
         o.on("--worktree PATH", "Serve an existing checkout instead of creating one") { |v| options[:worktree_path] = v }
       end
       parser.parse!(argv)
-      branch = argv.shift
-      raise Error, parser.banner if branch.nil?
+      branch = argv.shift || current_branch ||
+               raise(Error, "#{parser.banner}\n  no branch given, and the current directory is not on a branch")
 
       # The exact (project, branch) pair is the logical identity; only one
       # recorded environment may exist for it.
@@ -220,14 +221,13 @@ module DevEnv
     def cmd_down(argv)
       options = { worktree: true, database: true }
       parser = OptionParser.new do |o|
-        o.banner = "Usage: dev-env down <branch> [options]"
+        o.banner = "Usage: dev-env down [branch] [options]"
         o.on("--keep-worktree", "Leave the git worktree in place") { options[:worktree] = false }
         o.on("--remove-worktree", "Remove a worktree whose origin predates ownership tracking") { options[:force_worktree] = true }
         o.on("--keep-database", "Leave the database in place") { options[:database] = false }
       end
       parser.parse!(argv)
-      raise Error, parser.banner if argv.empty?
-      key = resolve(argv.shift)
+      key = resolve_target(argv, parser.banner)
       state = store.load(key)
 
       systemd.configure_process_manager(key, process_manager_for(state))
@@ -606,6 +606,14 @@ module DevEnv
       match = project_states.find { |state| state["branch"] == branch_or_key }
       return match["key"] if match
       raise Error, "no environment #{branch_or_key.inspect} for #{project.name} (try: dev-env list)"
+    end
+
+    # The branch checked out in the current directory, so `up` run inside a
+    # checkout can leave the branch off. Nil on a detached HEAD or outside a
+    # repository.
+    def current_branch
+      branch = capture("git", "branch", "--show-current")
+      branch unless branch.empty?
     end
 
     # The environment whose worktree contains the current directory, so a

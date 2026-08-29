@@ -48,7 +48,7 @@ class CLITest < Minitest::Test
   def test_help_prints_usage
     out, = capture_io { @cli.start(["help"]) }
     assert_includes out, "Usage: dev-env <command>"
-    assert_includes out, "up <branch>"
+    assert_includes out, "up [branch]"
     refute_match(/slot/i, out)
   end
 
@@ -117,6 +117,15 @@ class CLITest < Minitest::Test
     end
   end
 
+  def test_up_infers_the_branch_from_the_current_checkout_when_omitted
+    save_state(project: "proj", branch: "feature", port: 4001, identifier: "aaaaaaaa")
+    in_project do
+      system("git", "checkout", "-q", "-b", "feature")
+      error = assert_raises(DevEnv::Error) { @cli.send(:cmd_up, []) }
+      assert_includes error.message, "already has an environment", "expected the checked-out branch to be inferred"
+    end
+  end
+
   def test_id_validation_accepts_dns_labels_and_rejects_everything_else
     in_project do
       %w[pkliinp6 a a1 a-b 12345678 ab-cd-ef].each do |id|
@@ -175,6 +184,32 @@ class CLITest < Minitest::Test
       assert_equal ["dev_env_proj_4001_aaaaaaaa"], dropped, "a record without a database list drops its one database"
       assert_includes out, "proj/feature removed"
       refute_match(/kept for reuse|parking/i, out)
+    end
+  end
+
+  def test_down_infers_the_environment_from_the_current_worktree_when_omitted
+    worktree = Dir.mktmpdir.tap { |d| @tmp_dirs << d }
+    key = save_state(project: "proj", branch: "feature", port: 4001, identifier: "aaaaaaaa",
+                     "worktree" => worktree)
+
+    in_project do
+      @cli.send(:caddy).define_singleton_method(:reload) { nil }
+      @cli.send(:systemd).define_singleton_method(:systemctl) { |*| true }
+      @cli.send(:systemd).define_singleton_method(:configure_process_manager) { |*| nil }
+      stub_database_drops
+
+      out, = capture_io { Dir.chdir(worktree) { @cli.send(:cmd_down, []) } }
+
+      refute @store.exist?(key), "expected the environment to be inferred from the worktree"
+      assert_includes out, "proj/feature removed"
+    end
+  end
+
+  def test_down_without_argument_outside_a_worktree_fails_with_usage
+    save_state(project: "proj", branch: "feature", port: 4001, identifier: "aaaaaaaa")
+    in_project do
+      error = assert_raises(DevEnv::Error) { @cli.send(:cmd_down, []) }
+      assert_includes error.message, "Usage: dev-env down [branch]"
     end
   end
 
