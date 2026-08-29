@@ -109,6 +109,16 @@ class CLITest < Minitest::Test
     assert_includes out, "No environments."
   end
 
+  def test_ls_is_an_alias_for_list
+    save_state(project: "proj", branch: "feature", port: 4000, identifier: "aaaaaaaa")
+    @cli.send(:systemd).define_singleton_method(:status) { |_| "active" }
+
+    list_out, = capture_io { @cli.start(["list"]) }
+    ls_out, = capture_io { @cli.start(["ls"]) }
+
+    assert_equal list_out, ls_out
+  end
+
   def test_list_shows_exactly_project_branch_port_status_url_for_any_number_of_environments
     5.times { |n| save_state(project: "proj", branch: "branch-#{n}", port: 4000 + n, identifier: "id#{n}aaaa") }
     @cli.send(:systemd).define_singleton_method(:status) { |_| "inactive" }

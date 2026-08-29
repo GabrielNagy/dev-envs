@@ -7,6 +7,7 @@ module DevEnv
     include Util
 
     COMMANDS = %w[setup init up down list creds logs restart exec activate seed warm].freeze
+    COMMAND_ALIASES = { "ls" => "list" }.freeze
 
     USAGE = <<~TEXT
       Usage: dev-env <command> [options]
@@ -17,7 +18,7 @@ module DevEnv
         init              Write a starter .dev-env.json
         up [branch]       Create an environment: worktree, database and service
         down [branch]     Tear an environment down
-        list              Show every environment
+        list (ls)         Show every environment
         creds [branch]    Show the basic-auth credentials
         logs [branch] [-f]
                           Follow the log
@@ -44,6 +45,7 @@ module DevEnv
 
     def start(argv)
       command = argv.shift
+      command = COMMAND_ALIASES.fetch(command, command)
       if command.nil? || %w[-h --help help].include?(command)
         puts USAGE
       elsif COMMANDS.include?(command)

@@ -10,7 +10,7 @@ certificate per project.
 
 ```
 dev-env up <branch>     # create an environment
-dev-env list            # what is recorded, and where it answers
+dev-env list            # what is recorded, and where it answers (alias: ls)
 dev-env creds [branch]  # basic-auth credentials
 dev-env logs [branch] -f  # follow the log
 dev-env exec [branch] -c "bin/rails db:migrate:status"  # run one command in its context
