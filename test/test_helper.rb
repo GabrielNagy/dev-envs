@@ -5,7 +5,7 @@ require "tmpdir"
 require_relative "../lib/dev_env"
 
 # Builds a throwaway machine config and project without touching the real
-# ~/dev-envs or /etc/caddy.
+# ~/.config/dev-envs or /etc/caddy.
 module DevEnvTest
   def build_config(extra = {})
     @tmp_dirs ||= []

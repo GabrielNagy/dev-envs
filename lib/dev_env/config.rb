@@ -6,7 +6,7 @@ module DevEnv
   class Config
     attr_reader :home, :sites_dir, :caddyfile
 
-    def initialize(home: ENV.fetch("DEV_ENV_HOME", File.expand_path("~/dev-envs")),
+    def initialize(home: ENV.fetch("DEV_ENV_HOME", File.expand_path("~/.config/dev-envs")),
                    sites_dir: ENV.fetch("DEV_ENV_SITES_DIR", "/etc/caddy/sites"),
                    caddyfile: ENV.fetch("DEV_ENV_CADDYFILE", "/etc/caddy/Caddyfile"))
       @home = home

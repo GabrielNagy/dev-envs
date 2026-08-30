@@ -5,6 +5,13 @@ require_relative "test_helper"
 class ConfigTest < Minitest::Test
   include DevEnvTest
 
+  def test_default_home_is_xdg_config_directory
+    original = ENV.delete("DEV_ENV_HOME")
+    assert_equal File.expand_path("~/.config/dev-envs"), DevEnv::Config.new.home
+  ensure
+    ENV["DEV_ENV_HOME"] = original if original
+  end
+
   def test_missing_config_file_raises
     config = DevEnv::Config.new(home: Dir.mktmpdir.tap { |d| (@tmp_dirs ||= []) << d })
     assert_raises(DevEnv::Error) { config.base_domain }

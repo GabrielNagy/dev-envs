@@ -52,14 +52,14 @@ Needs postgres, Caddy, and one `*.<base domain>` wildcard DNS record pointing at
 the box.
 
 ```sh
-dev-env setup     # writes config.json, then re-run to write the Caddy config
+dev-env setup     # writes ~/.config/dev-envs/config.json, then re-run to write the Caddy config
 ```
 
 `setup` detects the public address, writes `/etc/caddy/Caddyfile` (via sudo) and
 installs the `dev-env@.service` systemd user template. Enable lingering so
 environments survive logout: `loginctl enable-linger $USER`.
 
-`config.json` is machine-local and gitignored — see `config.example.json`.
+`~/.config/dev-envs/config.json` is machine-local — see `config.example.json`.
 Environment IDs are unbounded in number, so one certificate per hostname would
 grow issuance without limit; every project is instead served under one shared
 `*.<base domain>` wildcard certificate obtained through DNS-01.
@@ -202,7 +202,7 @@ The adapter and the database list are recorded in the environment's state at
 
 ## Seed data
 
-`dev-env up` restores `~/dev-envs/dumps/<project>-seed.pdump` if present, and
+`dev-env up` restores `~/.config/dev-envs/dumps/<project>-seed.pdump` if present, and
 starts from a bare schema otherwise. `dev-env seed <branch>` rebuilds an
 existing environment's database from it. On MySQL the default dump is
 `<project>-seed.sql` — plain SQL, as `mysqldump` writes it.
