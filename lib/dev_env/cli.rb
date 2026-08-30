@@ -202,7 +202,7 @@ module DevEnv
           if state["worktree_owned"]
             step "Creating worktree #{worktree} for #{branch}"
             worktrees.create(worktree, branch, options[:base])
-            rollback << -> { worktrees.remove(worktree, quiet: true) }
+            rollback << -> { worktrees.remove(worktree, force: true, quiet: true) }
           else
             step "Using existing worktree #{worktree} for #{branch}"
           end
@@ -237,14 +237,16 @@ module DevEnv
     # ------------------------------------------------------------- lifecycle
 
     def cmd_down(argv)
-      options = { worktree: true, database: true, all: false }
+      options = { worktree: true, database: true, all: false, force: false }
       parser = OptionParser.new do |o|
         o.banner = "Usage: dev-env down [id] [options]"
         o.on("--all", "Tear down every recorded environment") { options[:all] = true }
         o.on("--keep-worktree", "Leave the git worktree in place") { options[:worktree] = false }
+        o.on("--force", "Discard changes in a worktree created by dev-env") { options[:force] = true }
         o.on("--keep-database", "Leave the database in place") { options[:database] = false }
       end
       parser.parse!(argv)
+      raise Error, "--force cannot be combined with --keep-worktree" if options[:force] && !options[:worktree]
 
       if options.delete(:all)
         raise Error, "#{parser.banner}\n  an environment ID cannot be combined with --all" unless argv.empty?
@@ -279,6 +281,10 @@ module DevEnv
 
     def teardown_environment(key, options, reload_caddy: true)
       state = store.load(key)
+      if options[:worktree] && state["worktree_owned"] && !options[:force] && Worktrees.dirty?(state["worktree"])
+        raise Error, "worktree #{state['worktree']} has uncommitted changes; rerun with --force to discard them, " \
+                     "or --keep-worktree to preserve them"
+      end
 
       systemd.configure_process_manager(key, process_manager_for(state))
       step "Stopping #{systemd.unit(key)}"
@@ -300,14 +306,14 @@ module DevEnv
         end
       end
 
-      # `remove --force` discards uncommitted work and cannot be undone, so
-      # removal requires positive evidence that dev-env created this worktree.
+      # Removal requires positive evidence that dev-env created this worktree;
+      # discarding changes additionally requires the caller's explicit consent.
       owned = state["worktree_owned"]
       if !options[:worktree]
         note "Leaving worktree #{state['worktree']} (--keep-worktree)" if owned
       elsif owned
         step "Removing worktree #{state['worktree']}"
-        Worktrees.remove(state["worktree"], root: state["project_root"])
+        Worktrees.remove(state["worktree"], root: state["project_root"], force: options[:force])
       else
         note "Leaving worktree #{state['worktree']} — dev-env did not create it"
       end

@@ -51,14 +51,28 @@ module DevEnv
       end
     end
 
-    def self.remove(worktree, root:, quiet: false)
+    def self.dirty?(worktree)
+      return false unless Dir.exist?(worktree)
+
+      output = IO.popen(["git", "-C", worktree, "status", "--porcelain", "--untracked-files=all"],
+                        err: [:child, :out], &:read)
+      status = $?
+      raise Error, "could not inspect worktree #{worktree}: #{output.strip}" unless status.success?
+
+      !output.empty?
+    end
+
+    def self.remove(worktree, root:, force: false, quiet: false)
       # Removal can be driven entirely by an environment record, including
       # `down --all` run outside any repository, because the owning project
       # root is persisted alongside the worktree path.
-      Util.run("git", "-C", root, "worktree", "remove", "--force", worktree, check: false, quiet: quiet)
+      command = ["git", "-C", root, "worktree", "remove"]
+      command << "--force" if force
+      Util.run(*command, worktree, quiet: quiet)
     end
 
-    def remove(worktree, quiet: false) = self.class.remove(worktree, root: @project.root, quiet: quiet)
+    def remove(worktree, force: false, quiet: false) =
+      self.class.remove(worktree, root: @project.root, force: force, quiet: quiet)
 
     # Untracked files a project needs in every worktree: gitignored secrets it
     # cannot check in, or settings branches predating a change would otherwise

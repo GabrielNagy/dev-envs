@@ -40,6 +40,14 @@ class WorktreesTest < Minitest::Test
     refute Dir.exist?(@path)
   end
 
+  def test_dirty_detects_uncommitted_changes
+    create_worktree
+    refute DevEnv::Worktrees.dirty?(@path)
+
+    File.write(File.join(@path, "uncommitted.txt"), "keep me")
+    assert DevEnv::Worktrees.dirty?(@path)
+  end
+
   def test_write_files_links_writes_and_excludes
     File.write(File.join(@repo, ".env.key"), "sekret")
     create_worktree

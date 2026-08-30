@@ -83,13 +83,15 @@ dev-env up feature-x --worktree ~/some/path   # or point at one explicitly
 When no checkout exists, `up` creates a worktree from the local branch, from
 `origin/<branch>`, or from `--base` when the branch is new.
 
-`down` removes a worktree only when `dev-env` created it. `git worktree remove
---force` discards uncommitted work and cannot be undone, so removal needs
-positive evidence of ownership rather than the absence of a reason to stop:
+`down` removes a worktree only when `dev-env` created it. If that worktree has
+uncommitted changes, teardown stops before removing anything and requires an
+explicit choice: `--force` discards the changes, while `--keep-worktree`
+preserves the checkout. An adopted worktree is never removed:
 
 | `up` recorded | `down` does |
 | --- | --- |
-| it created the worktree | removes it, unless `--keep-worktree` |
+| it created a clean worktree | removes it, unless `--keep-worktree` |
+| it created a dirty worktree | requires `--force` to remove or `--keep-worktree` to preserve |
 | it adopted the worktree | never removes it; no flag overrides this |
 
 The `up` summary marks an adopted worktree.

@@ -36,6 +36,17 @@ class CLITest < Minitest::Test
     key
   end
 
+  def create_owned_worktree
+    repo = Dir.mktmpdir.tap { |dir| @tmp_dirs << dir }
+    container = Dir.mktmpdir.tap { |dir| @tmp_dirs << dir }
+    worktree = File.join(container, "feature")
+    system("git", "init", "-q", "-b", "main", repo)
+    system("git", "-C", repo, "-c", "user.email=t@t", "-c", "user.name=t",
+           "commit", "-q", "--allow-empty", "-m", "init")
+    system("git", "-C", repo, "worktree", "add", "-q", "-b", "feature", worktree)
+    [repo, worktree]
+  end
+
   # Replaces the adapter's subprocesses so no test touches a real database
   # server; returns the list of dropped names.
   def stub_database_drops
@@ -241,6 +252,37 @@ class CLITest < Minitest::Test
       assert_includes out, "proj/feature removed"
       refute_match(/kept for reuse|parking/i, out)
     end
+  end
+
+  def test_down_requires_force_before_discarding_changes_in_an_owned_worktree
+    root, worktree = create_owned_worktree
+    File.write(File.join(worktree, "uncommitted.txt"), "keep me")
+    key = save_state(project: "proj", branch: "feature", port: 4001, id: "aaaaaaaa",
+                     "worktree" => worktree, "project_root" => root, "worktree_owned" => true)
+
+    error = assert_raises(DevEnv::Error) { @cli.send(:cmd_down, ["aaaaaaaa"]) }
+
+    assert_includes error.message, "has uncommitted changes"
+    assert_includes error.message, "--force"
+    assert_includes error.message, "--keep-worktree"
+    assert @store.exist?(key)
+    assert_path_exists worktree
+  end
+
+  def test_down_force_discards_changes_in_an_owned_worktree
+    root, worktree = create_owned_worktree
+    File.write(File.join(worktree, "uncommitted.txt"), "discard me")
+    key = save_state(project: "proj", branch: "feature", port: 4001, id: "aaaaaaaa",
+                     "worktree" => worktree, "project_root" => root, "worktree_owned" => true)
+    @cli.send(:teardown_caddy).define_singleton_method(:reload) { nil }
+    @cli.send(:systemd).define_singleton_method(:systemctl) { |*| true }
+    @cli.send(:systemd).define_singleton_method(:configure_process_manager) { |*| nil }
+    stub_database_drops
+
+    capture_io { @cli.send(:cmd_down, ["aaaaaaaa", "--force"]) }
+
+    refute @store.exist?(key)
+    refute_path_exists worktree
   end
 
   def test_down_does_not_accept_a_branch_as_an_explicit_target
