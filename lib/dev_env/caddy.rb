@@ -23,12 +23,12 @@ module DevEnv
       blocks << site_block(key, "guarded", @project.hosts_for(domain, guarded), "reverse_proxy 127.0.0.1:#{port}#{auth}") if guarded.any?
       blocks << site_block(key, "open", @project.hosts_for(domain, open), "reverse_proxy 127.0.0.1:#{port}") if open.any?
       FileUtils.mkdir_p(routes_dir)
-      File.write(site_path(key), "# Managed by dev-env — regenerated on `up`, removed on `down`.\n" + blocks.join("\n"))
+      atomic_write(site_path(key), "# Managed by dev-env — regenerated on `up`, removed on `down`.\n" + blocks.join("\n"))
     end
 
     def ensure_wildcard_site
       FileUtils.mkdir_p(routes_dir)
-      File.write(wildcard_site_path, <<~CADDY)
+      atomic_write(wildcard_site_path, <<~CADDY)
         # Managed by dev-env — one wildcard site covering every project and environment.
         https://*.#{@config.base_domain} {
           tls {

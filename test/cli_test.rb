@@ -94,6 +94,20 @@ class CLITest < Minitest::Test
     refute_match(/slot/i, out)
   end
 
+  def test_lifecycle_lock_rejects_a_concurrent_operation
+    other = DevEnv::CLI.new(config: @config)
+
+    @cli.send(:with_lifecycle_lock) do
+      error = assert_raises(DevEnv::Error) { other.send(:with_lifecycle_lock) { flunk "lock was acquired" } }
+      assert_includes error.message, "another dev-env lifecycle operation is running"
+      assert_includes error.message, Process.pid.to_s
+    end
+
+    acquired = false
+    other.send(:with_lifecycle_lock) { acquired = true }
+    assert acquired, "the lock should be released when the operation finishes"
+  end
+
   def test_base_domain_change_is_automatic_when_empty_and_requires_down_all_for_environments
     File.write(File.join(@config.sites_dir, DevEnv::Caddy::WILDCARD_SITE), <<~CADDY)
       # Managed by dev-env

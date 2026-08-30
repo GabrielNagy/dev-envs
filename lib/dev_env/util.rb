@@ -73,6 +73,24 @@ module DevEnv
       IO.popen(cmd, err: File::NULL, &:read).to_s.strip
     end
 
+    # Replace a generated file only after its complete contents are durable.
+    # The temporary file lives beside the destination, so rename is atomic.
+    def atomic_write(path, content, mode: nil)
+      directory = File.dirname(path)
+      FileUtils.mkdir_p(directory)
+      mode ||= File.stat(path).mode & 0o777 if File.exist?(path)
+      temporary = File.join(directory, ".#{File.basename(path)}.#{Process.pid}.#{SecureRandom.hex(6)}.tmp")
+      File.open(temporary, File::WRONLY | File::CREAT | File::EXCL, mode || 0o666) do |file|
+        file.write(content)
+        file.fsync
+      end
+      File.chmod(mode, temporary) if mode
+      File.rename(temporary, path)
+      content.bytesize
+    ensure
+      FileUtils.rm_f(temporary) if temporary
+    end
+
     def slugify(value)
       slug = value.downcase.gsub(/[^a-z0-9]+/, "-").gsub(/\A-+|-+\z/, "")[0, MAX_LABEL].sub(/-+\z/, "")
       raise Error, "could not derive a usable name from #{value.inspect}" if slug.empty?

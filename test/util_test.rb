@@ -43,6 +43,22 @@ class UtilTest < Minitest::Test
     assert_equal "", U.capture("sh", "-c", "echo oops >&2")
   end
 
+  def test_atomic_write_replaces_complete_contents_and_preserves_or_sets_mode
+    Dir.mktmpdir do |dir|
+      path = File.join(dir, "state.json")
+      File.write(path, "old")
+      File.chmod(0o640, path)
+
+      assert_equal 3, U.atomic_write(path, "new")
+      assert_equal "new", File.read(path)
+      assert_equal 0o640, File.stat(path).mode & 0o777
+      assert_empty Dir.glob(File.join(dir, ".*.tmp"))
+
+      U.atomic_write(path, "executable", mode: 0o700)
+      assert_equal 0o700, File.stat(path).mode & 0o777
+    end
+  end
+
   def test_format_duration_uses_readable_units
     assert_equal "125ms", U.format_duration(0.125)
     assert_equal "1s", U.format_duration(1.0)

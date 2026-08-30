@@ -19,6 +19,7 @@ module DevEnv
     def dump_dir   = File.join(home, "dumps")
     def run_dir    = File.join(home, "run")
     def secret_dir = File.join(home, "secrets")
+    def lock_path  = File.join(home, "lifecycle.lock")
     def unit_path  = File.expand_path("~/.config/systemd/user/dev-env@.service")
 
     def exist? = File.exist?(path)

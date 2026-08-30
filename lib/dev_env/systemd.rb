@@ -23,7 +23,7 @@ module DevEnv
 
     def install
       FileUtils.mkdir_p(File.dirname(@unit_path))
-      File.write(@unit_path, <<~UNIT)
+      atomic_write(@unit_path, <<~UNIT)
         [Unit]
         Description=dev-env %i
         After=network-online.target
@@ -61,7 +61,7 @@ module DevEnv
         return if File.exist?(path) && File.read(path) == content
 
         FileUtils.mkdir_p(File.dirname(path))
-        File.write(path, content)
+        atomic_write(path, content)
       else
         return unless File.exist?(path)
 

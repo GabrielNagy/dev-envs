@@ -102,7 +102,7 @@ module DevEnv
         body = Array(spec["content"]).join("\n")
         target = File.join(worktree, relative)
         FileUtils.mkdir_p(File.dirname(target))
-        File.write(target, interpolate(body, vars) + "\n")
+        atomic_write(target, interpolate(body, vars) + "\n")
 
         # git reads info/exclude from the common git dir, not the per-worktree
         # one, so writing to the latter would be silently ignored.
@@ -111,7 +111,7 @@ module DevEnv
           exclude = File.join(git_dir, "info", "exclude")
           FileUtils.mkdir_p(File.dirname(exclude))
           existing = File.exist?(exclude) ? File.read(exclude) : ""
-          File.write(exclude, "#{existing.chomp}\n#{relative}\n") unless existing.include?(relative)
+          atomic_write(exclude, "#{existing.chomp}\n#{relative}\n") unless existing.include?(relative)
         end
         ok "Wrote #{relative} into the worktree"
       end

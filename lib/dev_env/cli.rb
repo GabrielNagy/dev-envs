@@ -8,6 +8,7 @@ module DevEnv
 
     COMMANDS = %w[setup init up down list creds logs restart exec activate seed warm].freeze
     COMMAND_ALIASES = { "ls" => "list" }.freeze
+    LIFECYCLE_COMMANDS = %w[setup up down restart seed warm].freeze
 
     USAGE = <<~TEXT
       Usage: dev-env <command> [options]
@@ -49,10 +50,13 @@ module DevEnv
       if command.nil? || %w[-h --help help].include?(command)
         puts USAGE
       elsif COMMANDS.include?(command)
-        if @config.exist? && %w[up creds seed warm].include?(command)
-          Caddy.new(@config).ensure_certificate_configuration!
+        operation = proc do
+          if @config.exist? && %w[up creds seed warm].include?(command)
+            Caddy.new(@config).ensure_certificate_configuration!
+          end
+          send("cmd_#{command}", argv)
         end
-        send("cmd_#{command}", argv)
+        LIFECYCLE_COMMANDS.include?(command) ? with_lifecycle_lock(&operation) : operation.call
       else
         warn "#{color("Unknown command: #{command}", RED, stream: $stderr)}\n\n#{USAGE}"
         exit 1
@@ -76,7 +80,7 @@ module DevEnv
       FileUtils.chmod(0o700, @config.secret_dir)
 
       unless @config.exist?
-        File.write(@config.path, JSON.pretty_generate({
+        atomic_write(@config.path, JSON.pretty_generate({
           "base_domain" => "example.com",
           "bind_ip" => ip,
           "port_range" => [4000, 4999],
@@ -118,7 +122,7 @@ module DevEnv
       path = File.join(root, ".dev-env.json")
       raise Error, "#{path} already exists" if File.exist?(path)
 
-      File.write(path, JSON.pretty_generate({
+      atomic_write(path, JSON.pretty_generate({
         "name" => File.basename(root),
         "commands" => {
           "install" => "bundle check || bundle install --jobs 4",
@@ -492,6 +496,22 @@ module DevEnv
     end
 
     private
+
+    def with_lifecycle_lock
+      FileUtils.mkdir_p(@config.home)
+      File.open(@config.lock_path, File::RDWR | File::CREAT, 0o600) do |lock|
+        unless lock.flock(File::LOCK_EX | File::LOCK_NB)
+          owner = lock.read.strip
+          detail = owner.empty? ? "" : " (PID #{owner})"
+          raise Error, "another dev-env lifecycle operation is running#{detail}"
+        end
+
+        lock.truncate(0)
+        lock.write(Process.pid.to_s)
+        lock.flush
+        yield
+      end
+    end
 
     def project  = @project  ||= Project.load(@config)
     def store    = @store    ||= Store.new(state_dir: @config.state_dir, run_dir: @config.run_dir)
