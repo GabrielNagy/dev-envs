@@ -21,19 +21,19 @@ module DevEnv
         down [id]         Tear down an environment by its immutable ID
         down --all        Tear down every environment on this machine
         list (ls)         Show every environment
-        creds [branch]    Show the basic-auth credentials
-        logs [branch] [-f]
-                          Follow the log
-        restart [branch]  Restart the service
-        exec [branch] -c "command"
+        creds [target]    Show the basic-auth credentials
+        logs [target] [-f]
+                          Show or follow service logs
+        restart [target]  Restart the service
+        exec [target] -c "command"
                           Run a command in the environment's worktree and env
-        activate [branch] Open a shell in the environment's worktree and env; exit to leave
-        seed [branch]     Rebuild the database from the seed dump
+        activate [target] Open a shell in the environment's worktree and env; exit to leave
+        seed [target]     Rebuild the database from the seed dump
         warm              Rewrite recorded Caddy sites and pre-issue certificates
 
-      Run from inside an environment's worktree, commands taking [branch] and
-      `down` default to that environment when their target is omitted. `up`
-      defaults to the branch checked out in the current directory.
+      A target is an environment ID or an exact branch in the current project.
+      Inside an environment's worktree it may be omitted; `down` likewise
+      infers its ID. `up` defaults to the currently checked-out branch.
 
       Environments are created on demand, each served at an HTTPS hostname whose
       leftmost label combines its immutable ID and the project name. Subdomains
@@ -47,16 +47,24 @@ module DevEnv
     def start(argv)
       command = argv.shift
       command = COMMAND_ALIASES.fetch(command, command)
+      if command == "help" && argv.any?
+        raise Error, "Usage: dev-env help [command]" unless argv.one?
+
+        requested = argv.shift
+        command = COMMAND_ALIASES.fetch(requested, requested)
+        argv << "--help"
+      end
+      help_requested = argv.one? && %w[-h --help].include?(argv.first)
       if command.nil? || %w[-h --help help].include?(command)
         puts USAGE
       elsif COMMANDS.include?(command)
         operation = proc do
-          if @config.exist? && %w[up creds seed warm].include?(command)
+          if !help_requested && @config.exist? && %w[up creds seed warm].include?(command)
             Caddy.new(@config).ensure_certificate_configuration!
           end
           send("cmd_#{command}", argv)
         end
-        LIFECYCLE_COMMANDS.include?(command) ? with_lifecycle_lock(&operation) : operation.call
+        LIFECYCLE_COMMANDS.include?(command) && !help_requested ? with_lifecycle_lock(&operation) : operation.call
       else
         warn "#{color("Unknown command: #{command}", RED, stream: $stderr)}\n\n#{USAGE}"
         exit 1
@@ -69,10 +77,8 @@ module DevEnv
     # ------------------------------------------------------------------ setup
 
     def cmd_setup(argv)
-      parser = OptionParser.new do |o|
-        o.banner = "Usage: dev-env setup"
-      end
-      parser.parse!(argv)
+      parser = parse_options!(argv, "Usage: dev-env setup")
+      reject_arguments!(argv, parser.banner)
 
       ip = capture("sh", "-c", "ip -4 route get 1.1.1.1 2>/dev/null | grep -oP 'src \\K[0-9.]+'")
       raise Error, "could not detect a public IPv4 address" if ip.empty?
@@ -116,7 +122,10 @@ module DevEnv
       ok "Ready. Add .dev-env.json to a project with: dev-env init"
     end
 
-    def cmd_init(_argv)
+    def cmd_init(argv)
+      parser = parse_options!(argv, "Usage: dev-env init")
+      reject_arguments!(argv, parser.banner)
+
       root = capture("git", "rev-parse", "--show-toplevel")
       raise Error, "not inside a git repository" if root.empty?
       path = File.join(root, ".dev-env.json")
@@ -144,19 +153,18 @@ module DevEnv
 
     def cmd_up(argv)
       started_at = monotonic_time
-      options = { public: project.public?, base: "origin/main" }
-      parser = OptionParser.new do |o|
-        o.banner = "Usage: dev-env up [branch] [options]"
-        o.on("--seed PATH", "Dump to restore (default: #{project.default_dump})") { |v| options[:seed] = v; options[:seed_given] = true }
+      options = { base: "origin/main" }
+      parser = parse_options!(argv, "Usage: dev-env up [branch] [options]") do |o|
+        o.on("--seed PATH", "Dump to restore (default: project seed dump)") { |v| options[:seed] = v; options[:seed_given] = true }
         o.on("--no-seed", "Skip the dump; build the schema from migrations") { options[:no_seed] = true }
         o.on("--public", "Serve without HTTP basic auth (overrides .dev-env.json)") { options[:public] = true }
         o.on("--private", "Serve with configured basic auth (overrides .dev-env.json)") { options[:public] = false }
         o.on("--base REF", "Base ref when the branch does not exist (default: origin/main)") { |v| options[:base] = v }
         o.on("--worktree PATH", "Serve an existing checkout instead of creating one") { |v| options[:worktree_path] = v }
       end
-      parser.parse!(argv)
-      branch = argv.shift || current_branch ||
+      branch = optional_argument!(argv, parser.banner) || current_branch ||
                raise(Error, "#{parser.banner}\n  no branch given, and the current directory is not on a branch")
+      options[:public] = project.public? unless options.key?(:public)
 
       # The exact (project, branch) pair is the logical identity; only one
       # recorded environment may exist for it.
@@ -260,14 +268,12 @@ module DevEnv
 
     def cmd_down(argv)
       options = { worktree: true, database: true, all: false, force: false }
-      parser = OptionParser.new do |o|
-        o.banner = "Usage: dev-env down [id] [options]"
+      parser = parse_options!(argv, "Usage: dev-env down [id] [options]") do |o|
         o.on("--all", "Tear down every recorded environment") { options[:all] = true }
         o.on("--keep-worktree", "Leave the git worktree in place") { options[:worktree] = false }
         o.on("--force", "Discard changes in a worktree created by dev-env") { options[:force] = true }
         o.on("--keep-database", "Leave the database in place") { options[:database] = false }
       end
-      parser.parse!(argv)
       raise Error, "--force cannot be combined with --keep-worktree" if options[:force] && !options[:worktree]
 
       if options.delete(:all)
@@ -291,11 +297,10 @@ module DevEnv
         return ok("All environments removed")
       end
 
-      raise Error, parser.banner if argv.length > 1
-      key = if argv.empty?
+      id = optional_argument!(argv, parser.banner)
+      key = if id.nil?
               implicit_key || raise(Error, "#{parser.banner}\n  no ID given, and #{Dir.pwd} is not inside an environment's worktree")
             else
-              id = argv.shift
               environment_key_for(id) || raise(Error, "no environment #{id.inspect} (try: dev-env list)")
             end
       teardown_environment(key, options)
@@ -361,7 +366,10 @@ module DevEnv
       ok "#{state['project']}/#{state['branch']} removed"
     end
 
-    def cmd_list(_argv)
+    def cmd_list(argv)
+      parser = parse_options!(argv, "Usage: dev-env list")
+      reject_arguments!(argv, parser.banner)
+
       keys = store.keys
       return puts("No environments.") if keys.empty?
 
@@ -383,10 +391,12 @@ module DevEnv
     end
 
     def cmd_creds(argv)
+      parser = parse_options!(argv, "Usage: dev-env creds [target]")
+      target = optional_argument!(argv, parser.banner)
       guarded = project.subdomains.select { |sub| sub["auth"] }
       return puts("No hostname for #{project.name} is behind basic auth.") if guarded.empty?
 
-      key = argv.empty? ? implicit_key : resolve(argv.shift)
+      key = target ? resolve(target) : implicit_key
       if key.nil?
         project_states.each do |state|
           next unless secrets.password?(state["key"])
@@ -412,12 +422,17 @@ module DevEnv
     end
 
     def cmd_logs(argv)
-      key = resolve_target(argv, "Usage: dev-env logs [branch] [-f]")
-      exec("journalctl", "--user", "-u", systemd.unit(key), *argv)
+      follow = false
+      parser = parse_options!(argv, "Usage: dev-env logs [target] [-f]") do |o|
+        o.on("-f", "--follow", "Follow new log entries") { follow = true }
+      end
+      key = resolve_target(argv, parser.banner)
+      exec("journalctl", "--user", "-u", systemd.unit(key), *("--follow" if follow))
     end
 
     def cmd_restart(argv)
-      key = resolve_target(argv, "Usage: dev-env restart [branch]")
+      parser = parse_options!(argv, "Usage: dev-env restart [target]")
+      key = resolve_target(argv, parser.banner)
       state = store.load(key)
       systemd.configure_process_manager(key, process_manager_for(state))
       systemd.systemctl("restart", systemd.unit(key))
@@ -426,12 +441,10 @@ module DevEnv
 
     def cmd_exec(argv)
       command = nil
-      parser = OptionParser.new do |o|
-        o.banner = "Usage: dev-env exec [branch] -c \"command\""
+      parser = parse_options!(argv, "Usage: dev-env exec [target] -c \"command\"") do |o|
         o.on("-c COMMAND", "Command to run in the environment") { |v| command = v }
       end
-      parser.parse!(argv)
-      raise Error, parser.banner if command.nil?
+      raise Error, parser.banner if command.to_s.empty?
       key = resolve_target(argv, parser.banner)
       worktree = store.load(key)["worktree"]
       system(store.saved_env(key), command, chdir: worktree)
@@ -444,7 +457,8 @@ module DevEnv
     # units with a minimal PATH, and an interactive shell already has a
     # better one.
     def cmd_activate(argv)
-      key = resolve_target(argv, "Usage: dev-env activate [branch]")
+      parser = parse_options!(argv, "Usage: dev-env activate [target]")
+      key = resolve_target(argv, parser.banner)
       state = store.load(key)
       if nested_in_active_shell?
         # A child process cannot make its parent shell exit, so a shell
@@ -460,11 +474,9 @@ module DevEnv
 
     def cmd_seed(argv)
       options = {}
-      parser = OptionParser.new do |o|
-        o.banner = "Usage: dev-env seed [branch] [--seed PATH]"
-        o.on("--seed PATH", "Dump to restore (default: #{project.default_dump})") { |v| options[:seed] = v }
+      parser = parse_options!(argv, "Usage: dev-env seed [target] [--seed PATH]") do |o|
+        o.on("--seed PATH", "Dump to restore (default: project seed dump)") { |v| options[:seed] = v }
       end
-      parser.parse!(argv)
       key = resolve_target(argv, parser.banner)
       state = store.load(key)
       dump = options[:seed] || project.default_dump
@@ -490,7 +502,10 @@ module DevEnv
       ok(wait_for_boot(state["port"]) ? "Reseeded #{key}" : "Reseeded #{key}, not answering yet")
     end
 
-    def cmd_warm(_argv)
+    def cmd_warm(argv)
+      parser = parse_options!(argv, "Usage: dev-env warm")
+      reject_arguments!(argv, parser.banner)
+
       caddy.ensure_wildcard_site
       # Every recorded environment's site file is rewritten, not just new
       # ones': a subdomain added to .dev-env.json after an environment came up
@@ -524,6 +539,25 @@ module DevEnv
     end
 
     private
+
+    def parse_options!(argv, usage)
+      parser = OptionParser.new(usage)
+      yield parser if block_given?
+      parser.parse!(argv)
+      parser
+    rescue OptionParser::ParseError => error
+      raise Error, "#{error.message}\n#{parser}"
+    end
+
+    def reject_arguments!(argv, usage)
+      raise Error, "#{usage}\n  unexpected argument: #{argv.first.inspect}" unless argv.empty?
+    end
+
+    def optional_argument!(argv, usage)
+      argument = argv.shift
+      reject_arguments!(argv, usage)
+      argument
+    end
 
     def try_cleanup(failures, description)
       yield
@@ -757,12 +791,13 @@ module DevEnv
       environment_key_for(active) unless active.empty?
     end
 
-    # The explicit branch argument when given, otherwise the environment
-    # inferred from the current directory. Option-like arguments (`logs -f`)
-    # are left alone.
+    # The explicit target when given, otherwise the environment inferred from
+    # the current directory.
     def resolve_target(argv, usage)
-      return resolve(argv.shift) if argv.first && !argv.first.start_with?("-")
-      implicit_key || raise(Error, "#{usage}\n  no branch given, and #{Dir.pwd} is not inside an environment's worktree")
+      target = optional_argument!(argv, usage)
+      return resolve(target) if target
+
+      implicit_key || raise(Error, "#{usage}\n  no target given, and #{Dir.pwd} is not inside an environment's worktree")
     end
 
     # True when this command was run inside an activated shell, as opposed to

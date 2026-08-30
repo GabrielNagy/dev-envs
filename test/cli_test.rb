@@ -94,6 +94,31 @@ class CLITest < Minitest::Test
     refute_match(/slot/i, out)
   end
 
+  def test_every_command_supports_help_without_running
+    DevEnv::CLI::COMMANDS.each do |command|
+      out, = capture_io do
+        error = assert_raises(SystemExit) { @cli.start([command, "--help"]) }
+        assert_equal 0, error.status
+      end
+      assert_includes out, "Usage: dev-env #{command}"
+    end
+
+    out, = capture_io { assert_raises(SystemExit) { @cli.start(["help", "down"]) } }
+    assert_includes out, "Usage: dev-env down"
+  end
+
+  def test_invalid_options_and_extra_arguments_exit_cleanly
+    [["setup", "--bogus"], ["list", "extra"], ["up", "one", "two"]].each do |argv|
+      command = argv.first
+      _, err = capture_io do
+        error = assert_raises(SystemExit) { @cli.start(argv) }
+        assert_equal 1, error.status
+      end
+      assert_includes err, "Usage: dev-env #{command}"
+      refute_includes err, "cli.rb:"
+    end
+  end
+
   def test_lifecycle_lock_rejects_a_concurrent_operation
     other = DevEnv::CLI.new(config: @config)
 
@@ -178,6 +203,16 @@ class CLITest < Minitest::Test
     ls_out, = capture_io { @cli.start(["ls"]) }
 
     assert_equal list_out, ls_out
+  end
+
+  def test_logs_accepts_a_target_and_follow_option
+    save_state(project: "proj", branch: "feature", port: 4000, id: "aaaaaaaa")
+    executed = nil
+    @cli.define_singleton_method(:exec) { |*args| executed = args }
+
+    @cli.send(:cmd_logs, ["aaaaaaaa", "--follow"])
+
+    assert_equal ["journalctl", "--user", "-u", "dev-env@proj--feature--aaaaaaaa.service", "--follow"], executed
   end
 
   def test_list_shows_exactly_project_branch_port_status_url_for_any_number_of_environments

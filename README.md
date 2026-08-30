@@ -11,17 +11,17 @@ certificate for the machine's base domain.
 ```
 dev-env up <branch>     # create an environment
 dev-env list            # what is recorded, and where it answers (alias: ls)
-dev-env creds [branch]  # basic-auth credentials
-dev-env logs [branch] -f  # follow the log
-dev-env exec [branch] -c "bin/rails db:migrate:status"  # run one command in its context
-dev-env activate [branch]  # open a shell in its worktree + env; exit to leave
+dev-env creds [target]  # basic-auth credentials
+dev-env logs [target] -f  # follow the log
+dev-env exec [target] -c "bin/rails db:migrate:status"  # run one command in its context
+dev-env activate [target]  # open a shell in its worktree + env; exit to leave
 dev-env down <id>       # tear one environment down by its immutable ID
 dev-env down --all      # tear every active or inactive environment down
 ```
 
-Run from inside an environment's worktree, every command taking `[branch]` and
-`down` infer the environment from the current directory when their target is
-omitted.
+A target is an immutable environment ID or an exact branch in the current
+project. Run from inside an environment's worktree, commands taking `[target]`
+and `down` infer the environment from the current directory when it is omitted.
 
 Environments are served at `https://<id>-<project>.<base domain>`, plus one
 hostname per subdomain the project declares — by default `app`, folded into the
