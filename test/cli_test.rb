@@ -259,6 +259,46 @@ class CLITest < Minitest::Test
     end
   end
 
+  def test_failed_up_stops_the_service_and_reloads_caddy_before_rolling_back
+    cli = DevEnv::CLI.new(config: @config)
+    events = []
+    route = nil
+
+    in_project do
+      system("git", "add", ".dev-env.json")
+      system("git", "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "initial")
+      system("git", "checkout", "-qb", "feature")
+
+      cli.send(:systemd).define_singleton_method(:installed?) { true }
+      cli.send(:systemd).define_singleton_method(:configure_process_manager) { |*| nil }
+      cli.send(:systemd).define_singleton_method(:systemctl) { |*| events << :stop; true }
+      cli.send(:systemd).define_singleton_method(:status) { |_| "inactive" }
+      cli.send(:caddy).define_singleton_method(:reload) { events << :reload }
+      database = Object.new
+      database.define_singleton_method(:exists?) { |_| false }
+      database.define_singleton_method(:create) { |_| true }
+      database.define_singleton_method(:drop) do |*, **|
+        events << :drop
+        raise DevEnv::Error, "drop failed"
+      end
+      cli.define_singleton_method(:database_for) { |_| database }
+      cli.define_singleton_method(:build_environment) do |state, *|
+        route = cli.send(:caddy).site_path(state["key"])
+        FileUtils.mkdir_p(File.dirname(route))
+        File.write(route, "# route\n")
+        raise DevEnv::Error, "start failed"
+      end
+
+      capture_io do
+        assert_raises(DevEnv::Error) { cli.send(:cmd_up, ["feature", "--worktree", Dir.pwd, "--no-seed"]) }
+      end
+    end
+
+    assert_equal %i[stop reload drop], events
+    refute_path_exists route
+    assert_equal 1, @store.keys.length, "incomplete rollback should retain environment state"
+  end
+
   def test_down_removes_state_caddy_route_and_password
     key = save_state(project: "proj", branch: "feature", port: 4001, id: "aaaaaaaa")
     secrets = DevEnv::Secrets.new(@config.secret_dir)
@@ -270,6 +310,7 @@ class CLITest < Minitest::Test
       File.write(route, "# Managed by dev-env\n")
       @cli.send(:teardown_caddy).define_singleton_method(:reload) { nil }
       @cli.send(:systemd).define_singleton_method(:systemctl) { |*| true }
+      @cli.send(:systemd).define_singleton_method(:status) { |_| "inactive" }
       @cli.send(:systemd).define_singleton_method(:configure_process_manager) { |*| nil }
       dropped = stub_database_drops
 
@@ -282,6 +323,57 @@ class CLITest < Minitest::Test
       assert_includes out, "proj/feature removed"
       refute_match(/kept for reuse|parking/i, out)
     end
+  end
+
+  def test_down_keeps_resources_and_state_when_the_service_does_not_stop
+    key = save_state(project: "proj", branch: "feature", port: 4001, id: "aaaaaaaa")
+    @cli.send(:teardown_caddy).define_singleton_method(:reload) { nil }
+    @cli.send(:systemd).define_singleton_method(:systemctl) { |*| true }
+    @cli.send(:systemd).define_singleton_method(:status) { |_| "active" }
+    @cli.send(:systemd).define_singleton_method(:configure_process_manager) { |*| nil }
+    dropped = stub_database_drops
+
+    error = nil
+    capture_io { error = assert_raises(DevEnv::Error) { @cli.send(:cmd_down, ["aaaaaaaa"]) } }
+
+    assert_includes error.message, "did not stop"
+    assert_empty dropped
+    assert @store.exist?(key)
+  end
+
+  def test_down_continues_cleanup_and_keeps_retriable_state_after_a_drop_failure
+    root, worktree = create_owned_worktree
+    databases = %w[primary extra]
+    key = save_state(project: "proj", branch: "feature", port: 4001, id: "aaaaaaaa",
+                     "databases" => databases, "worktree" => worktree,
+                     "project_root" => root, "worktree_owned" => true)
+    @cli.send(:teardown_caddy).define_singleton_method(:reload) { nil }
+    @cli.send(:systemd).define_singleton_method(:systemctl) { |*| true }
+    @cli.send(:systemd).define_singleton_method(:status) { |_| "inactive" }
+    @cli.send(:systemd).define_singleton_method(:configure_process_manager) { |*| nil }
+    calls = []
+    fail_once = true
+    database = Object.new
+    database.define_singleton_method(:drop) do |name, **|
+      calls << name
+      if name == "primary" && fail_once
+        fail_once = false
+        raise DevEnv::Error, "database unavailable"
+      end
+    end
+    @cli.define_singleton_method(:database_for) { |_| database }
+
+    error = nil
+    capture_io { error = assert_raises(DevEnv::Error) { @cli.send(:cmd_down, ["aaaaaaaa"]) } }
+
+    assert_includes error.message, "drop database primary"
+    assert_equal databases, calls
+    assert @store.exist?(key)
+    refute_path_exists worktree, "worktree cleanup should continue after the database failure"
+
+    capture_io { @cli.send(:cmd_down, ["aaaaaaaa"]) }
+    assert_equal databases * 2, calls
+    refute @store.exist?(key)
   end
 
   def test_down_requires_force_before_discarding_changes_in_an_owned_worktree
@@ -306,6 +398,7 @@ class CLITest < Minitest::Test
                      "worktree" => worktree, "project_root" => root, "worktree_owned" => true)
     @cli.send(:teardown_caddy).define_singleton_method(:reload) { nil }
     @cli.send(:systemd).define_singleton_method(:systemctl) { |*| true }
+    @cli.send(:systemd).define_singleton_method(:status) { |_| "inactive" }
     @cli.send(:systemd).define_singleton_method(:configure_process_manager) { |*| nil }
     stub_database_drops
 
@@ -337,6 +430,7 @@ class CLITest < Minitest::Test
 
     units = []
     @cli.send(:systemd).define_singleton_method(:systemctl) { |*args| units << args; true }
+    @cli.send(:systemd).define_singleton_method(:status) { |_| "inactive" }
     @cli.send(:systemd).define_singleton_method(:configure_process_manager) { |*| nil }
     @cli.send(:teardown_caddy).define_singleton_method(:reload) { nil }
     dropped = stub_database_drops
@@ -361,6 +455,7 @@ class CLITest < Minitest::Test
     in_project do
       @cli.send(:teardown_caddy).define_singleton_method(:reload) { nil }
       @cli.send(:systemd).define_singleton_method(:systemctl) { |*| true }
+      @cli.send(:systemd).define_singleton_method(:status) { |_| "inactive" }
       @cli.send(:systemd).define_singleton_method(:configure_process_manager) { |*| nil }
       stub_database_drops
 
@@ -387,6 +482,7 @@ class CLITest < Minitest::Test
     in_project do
       @cli.send(:teardown_caddy).define_singleton_method(:reload) { nil }
       @cli.send(:systemd).define_singleton_method(:systemctl) { |*| true }
+      @cli.send(:systemd).define_singleton_method(:status) { |_| "inactive" }
       @cli.send(:systemd).define_singleton_method(:configure_process_manager) { |*| nil }
 
       state = @store.load(key)
@@ -406,6 +502,7 @@ class CLITest < Minitest::Test
     in_project("proj", "after_down" => ["cleanup ${PORT} ${BRANCH}", "exit 1"]) do
       @cli.send(:teardown_caddy).define_singleton_method(:reload) { nil }
       @cli.send(:systemd).define_singleton_method(:systemctl) { |*| true }
+      @cli.send(:systemd).define_singleton_method(:status) { |_| "inactive" }
       @cli.send(:systemd).define_singleton_method(:configure_process_manager) { |*| nil }
       stub_database_drops
       calls = []

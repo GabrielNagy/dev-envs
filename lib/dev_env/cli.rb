@@ -210,7 +210,7 @@ module DevEnv
           if state["worktree_owned"]
             step "Creating worktree #{worktree} for #{branch}"
             worktrees.create(worktree, branch, options[:base])
-            rollback << -> { worktrees.remove(worktree, force: true, quiet: true) }
+            rollback << ["remove worktree #{worktree}", -> { worktrees.remove(worktree, force: true, quiet: true) }]
           else
             step "Using existing worktree #{worktree} for #{branch}"
           end
@@ -221,17 +221,31 @@ module DevEnv
             step "Creating database #{name}"
             raise Error, "database #{name} already exists" if db.exists?(name)
             db.create(name)
-            rollback << -> { db.drop(name, quiet: true) }
+            rollback << ["drop database #{name}", -> { db.drop(name, quiet: true) }]
           end
 
           build_environment(state, seed, options, reservation)
         rescue StandardError => error
           note "Failed partway through — rolling back"
-          rollback.reverse_each { |undo| undo.call rescue nil }
-          systemd.configure_process_manager(key, nil)
-          secrets.delete_password(key)
-          store.delete(key)
-          caddy.delete_site(key)
+          failures = []
+          stopped = try_cleanup(failures, "stop #{systemd.unit(key)}") { stop_service!(key) }
+          if File.exist?(caddy.site_path(key))
+            try_cleanup(failures, "remove Caddy site") do
+              caddy.delete_site(key)
+              caddy.reload
+            end
+          end
+          rollback.reverse_each { |description, undo| try_cleanup(failures, description, &undo) } if stopped
+          note "Service is still running; leaving its databases and worktree intact" unless stopped
+          try_cleanup(failures, "remove systemd override") { systemd.configure_process_manager(key, nil) } if stopped
+          try_cleanup(failures, "remove password") { secrets.delete_password(key) } if failures.empty?
+
+          if failures.empty?
+            store.delete(key)
+          else
+            store.save(key, state)
+            note "Rollback incomplete (#{failures.join('; ')}); state kept for: dev-env down #{id}"
+          end
           raise error
         end
       ensure
@@ -294,40 +308,55 @@ module DevEnv
                      "or --keep-worktree to preserve them"
       end
 
-      systemd.configure_process_manager(key, process_manager_for(state))
-      step "Stopping #{systemd.unit(key)}"
-      systemd.systemctl("disable", "--now", systemd.unit(key), check: false)
+      failures = []
+      try_cleanup(failures, "configure #{systemd.unit(key)}") do
+        systemd.configure_process_manager(key, process_manager_for(state))
+      end
+      stopped = try_cleanup(failures, "stop #{systemd.unit(key)}") { stop_service!(key) }
 
-      run_after_down(state, options)
+      try_cleanup(failures, "remove Caddy site") do
+        step "Removing Caddy site"
+        # The wildcard certificate is shared by every project, so removing this
+        # hostname's route costs nothing at the next `up`.
+        teardown_caddy.delete_site(key)
+        teardown_caddy.reload if reload_caddy
+      end
 
-      step "Removing Caddy site"
-      # The wildcard certificate is shared by every project, so removing this
-      # hostname's route costs nothing at the next `up`.
-      teardown_caddy.delete_site(key)
-      teardown_caddy.reload if reload_caddy
+      if stopped
+        run_after_down(state, options)
 
-      if options[:database]
-        db = database_for(state)
-        databases_for(state).each do |name|
-          step "Dropping database #{name}"
-          db.drop(name)
+        if options[:database]
+          db = database_for(state)
+          databases_for(state).each do |name|
+            try_cleanup(failures, "drop database #{name}") do
+              step "Dropping database #{name}"
+              db.drop(name)
+            end
+          end
         end
+
+        # Removal requires positive evidence that dev-env created this worktree;
+        # discarding changes additionally requires the caller's explicit consent.
+        owned = state["worktree_owned"]
+        if !options[:worktree]
+          note "Leaving worktree #{state['worktree']} (--keep-worktree)" if owned
+        elsif owned
+          try_cleanup(failures, "remove worktree #{state['worktree']}") do
+            step "Removing worktree #{state['worktree']}"
+            Worktrees.remove(state["worktree"], root: state["project_root"], force: options[:force])
+          end
+        else
+          note "Leaving worktree #{state['worktree']} — dev-env did not create it"
+        end
+
+        try_cleanup(failures, "remove systemd override") { systemd.configure_process_manager(key, nil) }
+      else
+        note "Service is still running; leaving its databases and worktree intact"
       end
 
-      # Removal requires positive evidence that dev-env created this worktree;
-      # discarding changes additionally requires the caller's explicit consent.
-      owned = state["worktree_owned"]
-      if !options[:worktree]
-        note "Leaving worktree #{state['worktree']} (--keep-worktree)" if owned
-      elsif owned
-        step "Removing worktree #{state['worktree']}"
-        Worktrees.remove(state["worktree"], root: state["project_root"], force: options[:force])
-      else
-        note "Leaving worktree #{state['worktree']} — dev-env did not create it"
-      end
+      raise Error, "incomplete teardown; state kept: #{failures.join('; ')}" unless failures.empty?
 
       secrets.delete_password(key)
-      systemd.configure_process_manager(key, nil)
       store.delete(key)
       ok "#{state['project']}/#{state['branch']} removed"
     end
@@ -445,8 +474,7 @@ module DevEnv
       app_env = project.app_env_for(vars)
 
       systemd.configure_process_manager(key, process_manager_for(state))
-      step "Stopping #{systemd.unit(key)} while the database is rebuilt"
-      systemd.systemctl("stop", systemd.unit(key), check: false)
+      stop_service!(key, command: "stop", message: "Stopping #{systemd.unit(key)} while the database is rebuilt")
 
       db = database_for(state)
       step "Recreating #{databases_for(state).join(', ')}"
@@ -496,6 +524,22 @@ module DevEnv
     end
 
     private
+
+    def try_cleanup(failures, description)
+      yield
+      true
+    rescue Error, SystemCallError => error
+      failures << "#{description}: #{error.message}"
+      false
+    end
+
+    def stop_service!(key, command: "disable", message: "Stopping #{systemd.unit(key)}")
+      step message
+      args = command == "disable" ? ["disable", "--now"] : [command]
+      systemd.systemctl(*args, systemd.unit(key), check: false)
+      status = systemd.status(key)
+      raise Error, "#{systemd.unit(key)} did not stop (#{status.empty? ? 'unknown' : status})" unless %w[inactive failed].include?(status)
+    end
 
     def with_lifecycle_lock
       FileUtils.mkdir_p(@config.home)

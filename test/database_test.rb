@@ -68,4 +68,16 @@ class DatabaseTest < Minitest::Test
     assert_equal ["mysql", *flags, "-e", "DROP DATABASE IF EXISTS `db`"], calls[2]
     assert_equal ["sh", "-c", "mysql #{flags.join(' ')} db < /dumps/seed.sql"], calls[3]
   end
+
+  def test_drop_and_restore_commands_are_checked
+    [DevEnv::Database.for(nil), DevEnv::Database.for({ "adapter" => "mysql" })].each do |db|
+      checks = []
+      db.define_singleton_method(:run) { |*, **options| checks << options.fetch(:check, true); true }
+
+      db.drop("db")
+      db.restore("db", "/dump")
+
+      assert_equal [true, true], checks
+    end
+  end
 end

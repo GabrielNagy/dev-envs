@@ -61,6 +61,8 @@ module DevEnv
     end
 
     def self.remove(worktree, root:, force: false, quiet: false)
+      return true unless Dir.exist?(worktree)
+
       # Removal can be driven entirely by an environment record, including
       # `down --all` run outside any repository, because the owning project
       # root is persisted alongside the worktree path.

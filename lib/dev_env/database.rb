@@ -33,11 +33,9 @@ module DevEnv
 
       def exists?(name) = capture("psql", "-tAc", "SELECT 1 FROM pg_database WHERE datname = '#{name}'") == "1"
       def create(name)  = run("createdb", name)
-      def drop(name, quiet: false) = run("dropdb", "--if-exists", name, check: false, quiet: quiet)
+      def drop(name, quiet: false) = run("dropdb", "--if-exists", name, quiet: quiet)
 
-      # --no-owner restores exit nonzero on ignorable errors, so failure here
-      # cannot be treated as fatal; after_restore hooks finish the job.
-      def restore(name, dump) = run("pg_restore", "--no-owner", "--no-acl", "-d", name, dump, check: false)
+      def restore(name, dump) = run("pg_restore", "--no-owner", "--no-acl", "-d", name, dump)
 
       def url(name) = "postgresql:///#{name}"
     end
@@ -54,11 +52,11 @@ module DevEnv
       end
 
       def create(name) = run("mysql", *client_args, "-e", "CREATE DATABASE `#{name}`")
-      def drop(name, quiet: false) = run("mysql", *client_args, "-e", "DROP DATABASE IF EXISTS `#{name}`", check: false, quiet: quiet)
+      def drop(name, quiet: false) = run("mysql", *client_args, "-e", "DROP DATABASE IF EXISTS `#{name}`", quiet: quiet)
 
       # A MySQL seed dump is plain SQL, as mysqldump writes it.
       def restore(name, dump)
-        run("sh", "-c", "mysql #{Shellwords.join(client_args)} #{name} < #{Shellwords.escape(dump)}", check: false)
+        run("sh", "-c", "mysql #{Shellwords.join(client_args)} #{name} < #{Shellwords.escape(dump)}")
       end
 
       # mysql2:// is what Rails expects, which the defaults elsewhere also
