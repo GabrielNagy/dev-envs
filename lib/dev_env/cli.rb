@@ -97,7 +97,11 @@ module DevEnv
       end
 
       step "Writing #{@config.caddyfile} (needs sudo)"
-      IO.popen(["sudo", "tee", @config.caddyfile], "w") { |io| io.write(Caddy.new(@config).caddyfile_content) }
+      output, status = Open3.capture2("sudo", "tee", @config.caddyfile,
+                                     stdin_data: Caddy.new(@config).caddyfile_content)
+      print output
+      raise Error, "could not write #{@config.caddyfile}" unless status.success?
+
       run("sudo", "mkdir", "-p", @config.sites_dir)
       run("sudo", "chown", "#{ENV['USER']}:caddy", @config.sites_dir)
       run("sudo", "chmod", "2775", @config.sites_dir)

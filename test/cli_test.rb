@@ -108,6 +108,22 @@ class CLITest < Minitest::Test
     assert_includes error.message, "dev-env down --all"
   end
 
+  def test_setup_stops_when_writing_the_caddyfile_fails
+    @cli.define_singleton_method(:capture) { |*| "127.0.0.1" }
+    previous_path = ENV["PATH"]
+    bin = Dir.mktmpdir.tap { |dir| @tmp_dirs << dir }
+    File.write(File.join(bin, "sudo"), "#!/bin/sh\n/bin/cat >/dev/null\nexit 1\n")
+    FileUtils.chmod(0o755, File.join(bin, "sudo"))
+    ENV["PATH"] = bin
+
+    error = nil
+    capture_io { error = assert_raises(DevEnv::Error) { @cli.send(:cmd_setup, []) } }
+
+    assert_includes error.message, "could not write #{@config.caddyfile}"
+  ensure
+    ENV["PATH"] = previous_path
+  end
+
   def test_unknown_command_exits_nonzero
     exit_error = assert_raises(SystemExit) { capture_io { @cli.start(["bogus"]) } }
     assert_equal 1, exit_error.status

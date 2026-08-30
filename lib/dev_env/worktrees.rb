@@ -54,9 +54,7 @@ module DevEnv
     def self.dirty?(worktree)
       return false unless Dir.exist?(worktree)
 
-      output = IO.popen(["git", "-C", worktree, "status", "--porcelain", "--untracked-files=all"],
-                        err: [:child, :out], &:read)
-      status = $?
+      output, status = Open3.capture2e("git", "-C", worktree, "status", "--porcelain", "--untracked-files=all")
       raise Error, "could not inspect worktree #{worktree}: #{output.strip}" unless status.success?
 
       !output.empty?

@@ -48,6 +48,15 @@ class WorktreesTest < Minitest::Test
     assert DevEnv::Worktrees.dirty?(@path)
   end
 
+  def test_dirty_reports_git_inspection_failures
+    directory = Dir.mktmpdir.tap { |dir| @tmp_dirs << dir }
+
+    error = assert_raises(DevEnv::Error) { DevEnv::Worktrees.dirty?(directory) }
+
+    assert_includes error.message, "could not inspect worktree #{directory}"
+    assert_includes error.message, "not a git repository"
+  end
+
   def test_write_files_links_writes_and_excludes
     File.write(File.join(@repo, ".env.key"), "sekret")
     create_worktree
