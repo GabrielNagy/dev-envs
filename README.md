@@ -80,8 +80,9 @@ dev-env up feature-x                          # finds and adopts an existing che
 dev-env up feature-x --worktree ~/some/path   # or point at one explicitly
 ```
 
-When no checkout exists, `up` creates a worktree from the local branch, from
-`origin/<branch>`, or from `--base` when the branch is new.
+When no checkout exists, `up` creates a worktree from the local branch or from
+`origin/<branch>`. When the branch is new, it starts from the currently checked
+out branch by default; `--base` selects a different base ref.
 
 `down` removes a worktree only when `dev-env` created it. If that worktree has
 uncommitted changes, teardown stops before removing anything and requires an

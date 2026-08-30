@@ -153,17 +153,19 @@ module DevEnv
 
     def cmd_up(argv)
       started_at = monotonic_time
-      options = { base: "origin/main" }
+      options = {}
       parser = parse_options!(argv, "Usage: dev-env up [branch] [options]") do |o|
         o.on("--seed PATH", "Dump to restore (default: project seed dump)") { |v| options[:seed] = v; options[:seed_given] = true }
         o.on("--no-seed", "Skip the dump; build the schema from migrations") { options[:no_seed] = true }
         o.on("--public", "Serve without HTTP basic auth (overrides .dev-env.json)") { options[:public] = true }
         o.on("--private", "Serve with configured basic auth (overrides .dev-env.json)") { options[:public] = false }
-        o.on("--base REF", "Base ref when the branch does not exist (default: origin/main)") { |v| options[:base] = v }
+        o.on("--base REF", "Base ref when the branch does not exist (default: current branch)") { |v| options[:base] = v }
         o.on("--worktree PATH", "Serve an existing checkout instead of creating one") { |v| options[:worktree_path] = v }
       end
-      branch = optional_argument!(argv, parser.banner) || current_branch ||
+      checked_out_branch = current_branch
+      branch = optional_argument!(argv, parser.banner) || checked_out_branch ||
                raise(Error, "#{parser.banner}\n  no branch given, and the current directory is not on a branch")
+      options[:base] ||= checked_out_branch || capture("git", "rev-parse", "HEAD")
       options[:public] = project.public? unless options.key?(:public)
 
       # The exact (project, branch) pair is the logical identity; only one

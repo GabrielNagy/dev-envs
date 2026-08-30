@@ -258,6 +258,29 @@ class CLITest < Minitest::Test
     end
   end
 
+  def test_up_uses_the_current_branch_as_the_default_base_for_a_new_branch
+    base = nil
+    cli = DevEnv::CLI.new(config: @config)
+    in_project do
+      system("git", "add", ".dev-env.json")
+      system("git", "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "initial")
+      system("git", "checkout", "-qb", "parent")
+
+      cli.send(:systemd).define_singleton_method(:installed?) { true }
+      cli.send(:worktrees).define_singleton_method(:create) { |_, _, ref| base = ref }
+      database = Object.new
+      database.define_singleton_method(:exists?) { |_| false }
+      database.define_singleton_method(:create) { |_| true }
+      cli.define_singleton_method(:database_for) { |_| database }
+      cli.define_singleton_method(:build_environment) { |*| nil }
+      cli.define_singleton_method(:print_summary) { |_, total:| total }
+
+      capture_io { cli.send(:cmd_up, ["child", "--no-seed"]) }
+    end
+
+    assert_equal "parent", base
+  end
+
   def test_up_uses_the_project_public_default
     private_state = up_state_for({})
     assert_match(/\A[a-z0-9]{8}\z/, private_state["id"])
