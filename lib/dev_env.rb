@@ -1,14 +1,17 @@
 # frozen_string_literal: true
 
+require "digest"
 require "fileutils"
 require "json"
 require "net/http"
 require "open3"
 require "optparse"
+require "pathname"
 require "securerandom"
 require "shellwords"
 require "socket"
 require "time"
+require "tmpdir"
 
 # Run project branches on this box, each reachable over HTTPS. An environment
 # is created on demand for one branch: a git worktree, a database (postgres
@@ -26,6 +29,7 @@ require_relative "dev_env/secrets"
 require_relative "dev_env/store"
 require_relative "dev_env/database"
 require_relative "dev_env/project"
+require_relative "dev_env/install_cache"
 require_relative "dev_env/caddy"
 require_relative "dev_env/systemd"
 require_relative "dev_env/worktrees"

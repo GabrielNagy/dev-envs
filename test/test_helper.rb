@@ -18,7 +18,8 @@ module DevEnvTest
       "acme_email" => "x@example.com", "acme_dns_provider" => "route53",
     }.merge(extra)
     File.write(File.join(home, "config.json"), JSON.generate(settings))
-    DevEnv::Config.new(home: home, sites_dir: sites, caddyfile: File.join(sites, "Caddyfile"))
+    DevEnv::Config.new(home: home, sites_dir: sites, caddyfile: File.join(sites, "Caddyfile"),
+                       cache_dir: File.join(home, "cache"))
   end
 
   def build_project(config, settings = {}, root: "/repo")

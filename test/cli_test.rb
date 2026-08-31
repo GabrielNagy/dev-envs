@@ -190,6 +190,50 @@ class CLITest < Minitest::Test
     end
   end
 
+  def test_install_dependencies_restores_a_matching_cache_before_running_the_command
+    calls = File.join(Dir.mktmpdir.tap { |dir| @tmp_dirs << dir }, "calls")
+    install = <<~SH.strip
+      if [ -f node_modules/example/index.js ]; then echo seeded; else echo cold; fi >> #{Shellwords.escape(calls)}
+      mkdir -p node_modules/example && echo installed > node_modules/example/index.js
+    SH
+    settings = {
+      "commands" => { "install" => install },
+      "install_cache" => { "directory" => "node_modules", "key_files" => ["package.json", "yarn.lock"] },
+    }
+
+    in_project("proj", settings) do
+      File.write("package.json", "{\"private\":true}\n")
+      File.write("yarn.lock", "# lock\n")
+
+      first_out, = capture_io { @cli.send(:install_dependencies, install, Dir.pwd, {}) }
+      FileUtils.rm_rf("node_modules")
+      second_out, = capture_io { @cli.send(:install_dependencies, install, Dir.pwd, {}) }
+
+      assert_equal %w[cold seeded], File.readlines(calls, chomp: true)
+      assert_includes first_out, "Saving node_modules to the install cache"
+      assert_includes second_out, "Restoring cached node_modules"
+    end
+  end
+
+  def test_install_dependencies_does_not_cache_a_failed_install
+    install = "mkdir -p node_modules/example && exit 1"
+    settings = {
+      "commands" => { "install" => install },
+      "install_cache" => { "directory" => "node_modules", "key_files" => ["package.json", "yarn.lock"] },
+    }
+
+    in_project("proj", settings) do
+      File.write("package.json", "{\"private\":true}\n")
+      File.write("yarn.lock", "# lock\n")
+
+      capture_io do
+        assert_raises(DevEnv::Error) { @cli.send(:install_dependencies, install, Dir.pwd, {}) }
+      end
+
+      assert_empty Dir.glob(File.join(@config.cache_dir, "installs", "*", "fingerprint"))
+    end
+  end
+
   def test_list_with_no_environments
     out, = capture_io { @cli.start(["list"]) }
     assert_includes out, "No environments."

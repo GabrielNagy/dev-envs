@@ -123,12 +123,47 @@ Keys, all optional except `commands.server`:
 | `after_down` | Commands run by `down` after the service stops, before anything is removed |
 | `link_from_root` | Globs symlinked from the primary checkout into each worktree, for gitignored files such as credential keys |
 | `worktree_files` | Untracked files written into each worktree, optionally guarded by `unless_file_contains` |
+| `install_cache` | Seed an install directory from the last successful install with matching key files |
 | `seed`, `worktree_root` | Override the defaults |
 
 `${DOMAIN}`, `${DOMAIN_RE}`, `${PORT}`, `${DATABASE}`, `${DATABASE_URL}`,
 `${BRANCH}`, `${PROJECT}`, `${WORKTREE}` and `${TLD_LENGTH}` are interpolated, as
 are `${<SUB>_DOMAIN}` and `${<SUB>_DOMAIN_RE}` for each declared subdomain — an
 `mcp` subdomain gives `${MCP_DOMAIN}` and `${MCP_DOMAIN_RE}`.
+
+### Install cache
+
+A fresh worktree can start from an independent copy of a previous successful
+install instead of materialising every dependency from the package manager's
+cache again:
+
+```json
+"install_cache": {
+  "directory": "node_modules",
+  "key_files": [
+    "package.json",
+    "packages/*/package.json",
+    "yarn.lock",
+    ".yarnrc",
+    "mise.toml"
+  ]
+}
+```
+
+Before `commands.install`, dev-env restores `directory` only when it is absent
+and every `key_files` path or glob has the same contents. The install command
+itself is part of the cache key and always runs afterward, so Yarn, npm or any
+other installer remains responsible for validating the result. After a
+successful command, dev-env atomically saves the directory for the next
+worktree. A failed install is never cached.
+
+The snapshot is an ordinary recursive copy, not a symlink or hardlink, so one
+worktree cannot change another. Each repository keeps only its latest snapshot
+under `${XDG_CACHE_HOME:-~/.cache}/dev-envs/installs`; set `DEV_ENV_CACHE_DIR`
+to override the parent directory. List every manifest, lockfile, package-manager
+configuration and checked-in runtime-version file that can change the installed
+directory. Missing optional key files are included in the fingerprint, and
+globs allow workspace manifests to participate.
 
 `after_down` is for resources dev-env does not track — a paired worktree in a
 second repository, say. Hooks run in the environment's worktree with its saved

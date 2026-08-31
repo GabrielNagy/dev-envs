@@ -660,7 +660,7 @@ module DevEnv
       app_env = project.app_env_for(vars)
       commands = interpolate(project.commands, vars)
 
-      project_command(commands["install"], "Installing dependencies", worktree, app_env)
+      install_dependencies(commands["install"], worktree, app_env)
 
       if seed && !File.exist?(seed)
         raise Error, "seed dump not found: #{seed}" if options[:seed_given]
@@ -709,6 +709,18 @@ module DevEnv
     end
 
     # Steps of `up` and `seed` defined by the project; each is optional.
+    def install_dependencies(command, worktree, env)
+      return unless command
+
+      cache = if project.install_cache
+                InstallCache.new(cache_dir: @config.cache_dir, project_root: project.root, worktree: worktree,
+                                 command: command, spec: project.install_cache)
+              end
+      cache&.restore
+      project_command(command, "Installing dependencies", worktree, env)
+      cache&.store
+    end
+
     def project_command(command, message, worktree, env)
       return unless command
       step message

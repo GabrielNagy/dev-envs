@@ -4,14 +4,17 @@ module DevEnv
   # Machine-local configuration (config.json) and the directory layout
   # underneath the dev-env home.
   class Config
-    attr_reader :home, :sites_dir, :caddyfile
+    attr_reader :home, :sites_dir, :caddyfile, :cache_dir
 
     def initialize(home: ENV.fetch("DEV_ENV_HOME", File.expand_path("~/.config/dev-envs")),
                    sites_dir: ENV.fetch("DEV_ENV_SITES_DIR", "/etc/caddy/sites"),
-                   caddyfile: ENV.fetch("DEV_ENV_CADDYFILE", "/etc/caddy/Caddyfile"))
+                   caddyfile: ENV.fetch("DEV_ENV_CADDYFILE", "/etc/caddy/Caddyfile"),
+                   cache_dir: ENV.fetch("DEV_ENV_CACHE_DIR",
+                                        File.join(ENV.fetch("XDG_CACHE_HOME", File.expand_path("~/.cache")), "dev-envs")))
       @home = home
       @sites_dir = sites_dir
       @caddyfile = caddyfile
+      @cache_dir = cache_dir
     end
 
     def path       = File.join(home, "config.json")

@@ -48,6 +48,7 @@ module DevEnv
     def after_down      = Array(@settings["after_down"])
     def link_from_root  = Array(@settings["link_from_root"])
     def worktree_files  = @settings["worktree_files"] || {}
+    def install_cache   = @settings["install_cache"]
 
     def public?
       value = @settings.fetch("public", false)
