@@ -5,6 +5,24 @@ require_relative "test_helper"
 class CLITest < Minitest::Test
   include DevEnvTest
 
+  # Records what cloning a seed template asks of the server.
+  class FakeCloneDatabase
+    attr_reader :clones
+
+    def initialize
+      @clones = []
+      @databases = []
+    end
+
+    def exists?(name) = @databases.include?(name)
+    def create(name) = @databases << name
+    def drop(name, **) = @databases.delete(name)
+    def url(name) = "mysql2://127.0.0.1:3306/#{name}"
+    def resource_identity(name) = { "adapter" => "mysql", "host" => "127.0.0.1", "port" => 3306,
+                                    "database" => name }
+    def clone_from(template, name, **) = @clones << [template, name]
+  end
+
   def setup
     @config = build_config
     @cli = DevEnv::CLI.new(config: @config)
@@ -254,6 +272,71 @@ class CLITest < Minitest::Test
       end
 
       assert_empty Dir.glob(File.join(@config.cache_dir, "installs", "*", "fingerprint"))
+    end
+  end
+
+  def test_seeding_prefers_a_configured_template_over_the_dump
+    settings = { "seed_template" => { "build" => "load-seed ${DATABASE}" } }
+
+    in_project("proj", settings) do
+      template, dump = @cli.send(:seeding, {})
+
+      assert_equal "dev_env_proj_template", template.database
+      assert_nil dump
+    end
+  end
+
+  def test_seeding_lets_one_run_name_a_dump_instead_of_the_template
+    settings = { "seed_template" => { "build" => "load-seed ${DATABASE}" } }
+
+    in_project("proj", settings) do
+      template, dump = @cli.send(:seeding, { seed: "/dumps/other.sql" })
+
+      assert_nil template
+      assert_equal "/dumps/other.sql", dump
+    end
+  end
+
+  def test_seeding_skips_both_for_no_seed
+    settings = { "seed_template" => { "build" => "load-seed ${DATABASE}" } }
+
+    in_project("proj", settings) do
+      assert_equal [nil, nil], @cli.send(:seeding, { no_seed: true })
+    end
+  end
+
+  def test_seeding_falls_back_to_the_project_dump_without_a_template
+    in_project("proj") do
+      template, dump = @cli.send(:seeding, {})
+
+      assert_nil template
+      assert_equal File.join(@config.dump_dir, "proj-seed.pdump"), dump
+    end
+  end
+
+  def test_cloning_a_template_builds_it_once_and_runs_after_restore
+    calls = File.join(Dir.mktmpdir.tap { |dir| @tmp_dirs << dir }, "calls")
+    settings = {
+      "seed_template" => { "build" => "echo built ${DATABASE} $DATABASE_URL >> #{Shellwords.escape(calls)}" },
+      "env" => { "DATABASE_URL" => "${DATABASE_URL}?ssl-mode=REQUIRED" },
+      "after_restore" => ["echo hooked >> #{Shellwords.escape(calls)}"],
+    }
+
+    in_project("proj", settings) do
+      db = FakeCloneDatabase.new
+      template = @cli.send(:project).seed_template
+
+      2.times do
+        capture_io { @cli.send(:clone_template, template, db, "dev_env_proj_4000_ab", Dir.pwd, {}, {}) }
+      end
+
+      # The template is built once and cloned twice, and however the database
+      # was seeded the project's hook runs after it. Rebuilding the project
+      # environment from template variables preserves its configured URL
+      # options while changing the database name.
+      assert_equal ["built dev_env_proj_template mysql2://127.0.0.1:3306/dev_env_proj_template?ssl-mode=REQUIRED",
+                    "hooked", "hooked"], File.readlines(calls, chomp: true)
+      assert_equal [["dev_env_proj_template", "dev_env_proj_4000_ab"]] * 2, db.clones
     end
   end
 

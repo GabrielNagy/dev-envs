@@ -73,6 +73,17 @@ module DevEnv
       IO.popen(cmd, err: File::NULL, &:read).to_s.strip
     end
 
+    # capture for a command whose failure must not pass as an answer. capture
+    # swallows the exit status, which suits a query whose empty output is
+    # itself a result and not a query whose empty output would be mistaken
+    # for one. Statements too long for a command line go in through stdin.
+    def capture!(*cmd, stdin: nil)
+      out, err, status = Open3.capture3(*cmd, stdin_data: stdin.to_s)
+      raise Error, "command failed: #{cmd.join(' ')}\n#{err.strip}" unless status.success?
+
+      out
+    end
+
     # capture for a project-supplied shell string, run in an environment's
     # worktree with its variables. A command that fails is indistinguishable
     # from one that prints nothing: callers use this where neither aborts.

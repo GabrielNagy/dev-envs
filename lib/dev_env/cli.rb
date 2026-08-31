@@ -28,7 +28,7 @@ module DevEnv
         exec [target] -c "command"
                           Run a command in the environment's worktree and env
         activate [target] Open a shell in the environment's worktree and env; exit to leave
-        seed [target]     Rebuild the database from the seed dump
+        seed [target]     Rebuild the database from the seed template or dump
         warm              Rewrite recorded Caddy sites and pre-issue certificates
 
       A target is an environment ID or an exact branch in the current project.
@@ -161,7 +161,7 @@ module DevEnv
       started_at = monotonic_time
       options = {}
       parser = parse_options!(argv, "Usage: dev-env up [branch] [options]") do |o|
-        o.on("--seed PATH", "Dump to restore (default: project seed dump)") { |v| options[:seed] = v; options[:seed_given] = true }
+        o.on("--seed PATH", "Dump to restore (default: project seed dump)") { |v| options[:seed] = v }
         o.on("--no-seed", "Skip the dump; build the schema from migrations") { options[:no_seed] = true }
         o.on("--public", "Serve without HTTP basic auth (overrides project configuration)") { options[:public] = true }
         o.on("--private", "Serve with configured basic auth (overrides project configuration)") { options[:public] = false }
@@ -411,8 +411,8 @@ module DevEnv
       with_environment_lifecycle_lock(state["project_root"], state["project"], state["branch"]) do
         Caddy.new(@config).ensure_certificate_configuration!
         state = store.load(key)
-        dump = options[:seed] || project.default_dump
-        raise Error, "seed dump not found: #{dump}" unless File.exist?(dump)
+        template, dump = seeding(options)
+        raise Error, "seed dump not found: #{dump}" if dump && !File.exist?(dump)
 
         vars = project.vars_for(state)
         app_env = project.app_env_for(vars)
@@ -426,7 +426,11 @@ module DevEnv
           db.drop(name)
           db.create(name)
         end
-        restore_dump(db, state["database"], dump, state["worktree"], app_env, vars)
+        if template
+          clone_template(template, db, state["database"], state["worktree"], app_env, vars)
+        else
+          restore_dump(db, state["database"], dump, state["worktree"], app_env, vars)
+        end
 
         project_command(interpolate(project.commands, vars)["migrate"], "Running migrations", state["worktree"], app_env)
 
@@ -653,7 +657,6 @@ module DevEnv
           worktree = File.expand_path(options[:worktree_path] || worktrees.existing_for(branch) ||
                                       File.join(project.worktree_root, "#{slugify(branch)}--#{id}"))
           worktrees.verify_adopted!(worktree, branch) if Dir.exist?(worktree)
-          seed = options[:no_seed] ? nil : (options[:seed] || project.default_dump)
 
           state = {
             "id" => id, "key" => key, "project" => project.name, "branch" => branch,
@@ -703,7 +706,7 @@ module DevEnv
               rollback << ["drop database #{name}", -> { db.drop(name, quiet: true) }]
             end
 
-            build_environment(state, seed, options, reservation)
+            build_environment(state, options, reservation)
           rescue StandardError => error
             note "Failed partway through — rolling back"
             failures = []
@@ -738,7 +741,7 @@ module DevEnv
       end
     end
 
-    def build_environment(state, seed, options, reservation)
+    def build_environment(state, options, reservation)
       key, branch, worktree, domain, port, database =
         state.values_at("key", "branch", "worktree", "domain", "port", "database")
       vars = project.vars_for(state)
@@ -747,13 +750,16 @@ module DevEnv
 
       install_dependencies(commands["install"], worktree, app_env)
 
+      template, seed = seeding(options)
       if seed && !File.exist?(seed)
-        raise Error, "seed dump not found: #{seed}" if options[:seed_given]
+        raise Error, "seed dump not found: #{seed}" if options.key?(:seed)
         note "No seed dump at #{seed} — starting with an empty database"
         seed = nil
       end
 
-      if seed
+      if template
+        clone_template(template, database_for(state), database, worktree, app_env, vars)
+      elsif seed
         restore_dump(database_for(state), database, seed, worktree, app_env, vars)
       else
         project_command(commands["schema"], "Loading schema", worktree, app_env)
@@ -791,10 +797,43 @@ module DevEnv
       note "Not answering on 127.0.0.1:#{port} yet — check: dev-env logs #{branch} -f" unless wait_for_boot(port)
     end
 
+    # How this run seeds the database: a template to clone, or a dump to
+    # restore, or neither. A configured seed template replaces the dump, since
+    # cloning a database already on this server beats replaying a dump into a
+    # new one, but a --seed naming a dump or a --no-seed still decides for the
+    # one run.
+    def seeding(options)
+      return [nil, nil] if options[:no_seed]
+
+      template = project.seed_template unless options.key?(:seed)
+      return [template, nil] if template
+
+      [nil, options[:seed] || project.default_dump]
+    end
+
     def restore_dump(db, database, dump, worktree, app_env, vars)
       step "Restoring #{dump} into #{database}"
       db.restore(database, dump)
+      run_after_restore(worktree, app_env, vars)
+    end
 
+    def clone_template(template, db, database, worktree, app_env, vars)
+      # Derive the project environment again after pointing interpolation at
+      # the template. This preserves configured DATABASE_URL options instead
+      # of replacing them with the adapter's bare URL after interpolation.
+      template_vars = vars.merge(
+        "DATABASE" => template.database,
+        "DATABASE_URL" => db.url(template.database),
+      )
+      template_env = project.app_env_for(template_vars)
+      template_env["DATABASE"] = template.database
+      template_env["DATABASE_URL"] = template_vars["DATABASE_URL"] unless template_env.key?("DATABASE_URL")
+      template.clone_into(db, database, worktree, template_env, template_vars)
+      run_after_restore(worktree, app_env, vars)
+    end
+
+    # However the database was seeded, the project gets the same hook after.
+    def run_after_restore(worktree, app_env, vars)
       project.after_restore.each { |command| sh(interpolate(command, vars), chdir: worktree, env: app_env) }
     end
 

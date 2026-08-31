@@ -56,6 +56,18 @@ module DevEnv
     def worktree_files  = @settings["worktree_files"] || {}
     def install_cache   = @settings["install_cache"]
 
+    # Seed each environment by cloning a template database kept on the same
+    # server, instead of restoring a dump into every one of them. nil when
+    # the project does not configure one.
+    def seed_template
+      return @seed_template if defined?(@seed_template)
+
+      spec = @settings["seed_template"]
+      @seed_template = spec && SeedTemplate.new(cache_dir: @config.cache_dir, project_root: root,
+                                                default_database: "dev_env_#{name.tr('-', '_')}_template",
+                                                spec: spec)
+    end
+
     # Label => command. Each runs at the end of `up` and contributes one row
     # to its summary.
     def summary

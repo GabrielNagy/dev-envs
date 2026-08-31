@@ -148,12 +148,13 @@ Keys, all optional except `commands.server`:
 | `process_manager` | Set to `overmind` when `commands.server` delegates to Overmind |
 | `database` | Engine and connection: `adapter`, `host`, `port`, `user`, `extra` |
 | `env` | Environment variables for those commands and the service |
-| `after_restore` | Commands to run after a dump is restored |
+| `after_restore` | Commands to run after the database is seeded |
 | `after_down` | Commands run by `down` after the service stops, before anything is removed |
 | `summary` | Labelled commands whose output becomes a row of the `up` summary |
 | `link_from_root` | Globs symlinked from the primary checkout into each worktree, for gitignored files such as credential keys |
 | `worktree_files` | Untracked files written into each worktree, optionally guarded by `unless_file_contains` |
 | `install_cache` | Seed an install directory from the last successful install with matching key files |
+| `seed_template` | Seed each environment by cloning a template database instead of restoring a dump |
 | `seed`, `worktree_root` | Override the defaults |
 
 `${DOMAIN}`, `${DOMAIN_RE}`, `${PORT}`, `${DATABASE}`, `${DATABASE_URL}`,
@@ -297,6 +298,54 @@ project configuration edits.
 starts from a bare schema otherwise. `dev-env seed <branch>` rebuilds an
 existing environment's database from it. On MySQL the default dump is
 `<project>-seed.sql` — plain SQL, as `mysqldump` writes it.
+
+### Seed templates
+
+Restoring a dump costs the same minutes in every environment, and a dump
+published once a day is the same dump every time. A project can instead keep one
+seeded database on the server and have `up` clone it:
+
+```json
+"seed_template": {
+  "build": "bin/rails 'db:dump:import[lightweight]'",
+  "max_age": "1d"
+}
+```
+
+`build` is the project's own command for filling a database, run in the
+environment's worktree. Both `${DATABASE}` and `${DATABASE_URL}` name the
+template rather than the environment, and so do `DATABASE` and `DATABASE_URL`
+in the command's own environment, so a command that reads `DATABASE_URL` for
+itself needs no change. Whatever the project already knows about fetching and
+loading its seed data stays where it is; dev-env only decides when to ask.
+
+The template is rebuilt when it is missing, when it is older than `max_age`
+(`30m`, `12h`, `1d`; one day by default), or when the `build` command changes.
+A build that fails leaves the template marked unusable rather than leaving the
+previous build to vouch for what the failure loaded, so the next `up` rebuilds
+it. `database` names it, defaulting to `dev_env_<project>_template`; it is
+machine-local state like the install cache, so `down` leaves it alone.
+
+Rebuilding drops the template first, so dev-env refuses to touch a database of
+that name the current project has no record of building on that database
+server. Ownership and locking follow the adapter, server endpoint and database
+name, so changing servers or using the same name from another repository fails
+closed. Point `database` somewhere else, or drop it yourself, if that happens.
+
+One lock covers building and cloning together, so concurrent `up` commands
+build the template once and then clone it one after another.
+
+Each engine clones the way it can. Postgres copies the database itself through
+`CREATE DATABASE ... TEMPLATE`. MySQL and MariaDB have no equivalent, so the
+adapter loads the template's schema and then copies its rows with
+`INSERT ... SELECT` across several clients at once — the rows never leave the
+server, which is what makes it faster than replaying a dump. Against a 1.5GB
+template that took around 10 seconds where the dump took 75. Views are copied
+as definitions rather than inserted into, and triggers are installed once the
+rows are in, so a trigger does not fire for every row the clone copies.
+
+A configured template replaces the dump. `up --seed PATH` restores that dump
+instead for one run, and `up --no-seed` skips seeding altogether.
 
 ## Certificates and capacity
 
