@@ -150,13 +150,20 @@ module DevEnv
     # systemd user units start with a minimal PATH, so version managers under
     # ~/.local/bin would not resolve. Carry an explicit one into both the
     # setup commands and the generated environment file.
+    #
+    # A null in project configuration drops the variable rather than setting it
+    # empty, which is the only way to withhold one of the defaults above. A
+    # project whose framework reads its own configuration files needs that:
+    # dotenv, for one, skips any variable the environment already defines, so
+    # exporting DATABASE_URL would override the per-environment .env files that
+    # keep a test database apart from a development one.
     def app_env_for(vars)
       {
         "DATABASE_URL" => vars["DATABASE_URL"],
         "PORT" => vars["PORT"],
         "WORKTREE" => vars["WORKTREE"],
         "PATH" => "#{File.expand_path('~/.local/bin')}:/usr/local/bin:/usr/bin:/bin",
-      }.merge(interpolate(@settings["env"] || {}, vars))
+      }.merge(interpolate(@settings["env"] || {}, vars)).compact
     end
   end
 end
