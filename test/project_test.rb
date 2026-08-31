@@ -52,6 +52,14 @@ class ProjectTest < Minitest::Test
     assert_equal ["bin/cleanup"], build_project(@config, { "after_down" => ["bin/cleanup"] }).after_down
   end
 
+  def test_summary_defaults_empty_and_requires_an_object
+    assert_equal({}, build_project(@config).summary)
+    assert_equal({ "Login" => "bin/token" }, build_project(@config, { "summary" => { "Login" => "bin/token" } }).summary)
+
+    error = assert_raises(DevEnv::Error) { build_project(@config, { "summary" => ["bin/token"] }).summary }
+    assert_includes error.message, "must be an object"
+  end
+
   def test_public_defaults_false_and_requires_a_boolean
     refute build_project(@config).public?
     assert build_project(@config, { "public" => true }).public?

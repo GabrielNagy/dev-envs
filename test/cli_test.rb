@@ -400,6 +400,32 @@ class CLITest < Minitest::Test
     end
   end
 
+  def test_up_summary_prints_a_row_per_summary_command
+    worktree = Dir.mktmpdir.tap { |dir| @tmp_dirs << dir }
+    key = save_state(project: "proj", branch: "feature", port: 4001, id: "aaaaaaaa",
+                     "worktree" => worktree)
+
+    in_project("proj", "summary" => { "Login" => "echo https://${DOMAIN}/admin?lt=$(basename $(pwd))" }) do
+      out, = capture_io { @cli.send(:print_summary, key, total: 1) }
+
+      assert_includes out, "Login      https://aaaaaaaa-proj.example.com/admin?lt=#{File.basename(worktree)}"
+    end
+  end
+
+  def test_up_summary_warns_instead_of_printing_a_row_for_a_silent_command
+    worktree = Dir.mktmpdir.tap { |dir| @tmp_dirs << dir }
+    key = save_state(project: "proj", branch: "feature", port: 4001, id: "aaaaaaaa",
+                     "worktree" => worktree)
+
+    in_project("proj", "summary" => { "Login" => "exit 3" }) do
+      out, err = capture_io { @cli.send(:print_summary, key, total: 1) }
+
+      refute_includes out, "Login"
+      assert_includes err, "Login"
+      assert out.rstrip.end_with?("Total      [1s]"), out
+    end
+  end
+
   def test_failed_up_stops_the_service_and_reloads_caddy_before_rolling_back
     cli = DevEnv::CLI.new(config: @config)
     events = []

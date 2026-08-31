@@ -73,6 +73,15 @@ module DevEnv
       IO.popen(cmd, err: File::NULL, &:read).to_s.strip
     end
 
+    # capture for a project-supplied shell string, run in an environment's
+    # worktree with its variables. A command that fails is indistinguishable
+    # from one that prints nothing: callers use this where neither aborts.
+    def capture_sh(command, chdir:, env: {})
+      IO.popen(env, command, err: File::NULL, chdir: chdir, &:read).to_s.strip
+    rescue SystemCallError
+      ""
+    end
+
     # Replace a generated file only after its complete contents are durable.
     # The temporary file lives beside the destination, so rename is atomic.
     def atomic_write(path, content, mode: nil)

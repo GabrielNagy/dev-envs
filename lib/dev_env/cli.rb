@@ -849,11 +849,29 @@ module DevEnv
       puts "  #{color('Basic auth', BOLD)} #{auth}"
       puts "  #{color('Worktree'.ljust(10), BOLD)} #{state['worktree']}#{adopted}"
       puts "  #{color('Database'.ljust(10), BOLD)} #{databases_for(state).join(', ')}  (port #{state['port']})"
+      summary_rows(state, key).each { |label, value| puts "  #{color(label.ljust(10), BOLD)} #{color(value, CYAN)}" }
       puts
       puts "  #{color('Logs'.ljust(10), BOLD)} #{color("dev-env logs #{state['branch']} -f", CYAN)}"
       puts "  #{color('Tear down'.ljust(10), BOLD)} #{color("dev-env down #{state['id']}", CYAN)}"
       puts
       puts "  #{color('Total'.ljust(10), BOLD)} #{duration_tag(total)}"
+    end
+
+    # Project-defined rows for the summary: one command per label, each run in
+    # the environment's worktree with the variables its service runs with. The
+    # last line of stdout is the value, so a command may log ahead of it.
+    #
+    # `up` has already succeeded by the time these run, so a command that fails
+    # or prints nothing costs its row and a warning, never the environment.
+    def summary_rows(state, key)
+      env = store.saved_env(key)
+      interpolate(project.summary, project.vars_for(state)).filter_map do |label, command|
+        value = capture_sh(command, chdir: state["worktree"], env: env).lines.last.to_s.strip
+        next [label, value] unless value.empty?
+
+        note "summary command for #{label} printed nothing: #{command}"
+        nil
+      end
     end
 
     # Non-destructive commands accept either an immutable environment ID or an

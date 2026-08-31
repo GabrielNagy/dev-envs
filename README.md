@@ -150,6 +150,7 @@ Keys, all optional except `commands.server`:
 | `env` | Environment variables for those commands and the service |
 | `after_restore` | Commands to run after a dump is restored |
 | `after_down` | Commands run by `down` after the service stops, before anything is removed |
+| `summary` | Labelled commands whose output becomes a row of the `up` summary |
 | `link_from_root` | Globs symlinked from the primary checkout into each worktree, for gitignored files such as credential keys |
 | `worktree_files` | Untracked files written into each worktree, optionally guarded by `unless_file_contains` |
 | `install_cache` | Seed an install directory from the last successful install with matching key files |
@@ -193,6 +194,29 @@ to override the parent directory. List every manifest, lockfile, package-manager
 configuration and checked-in runtime-version file that can change the installed
 directory. Missing optional key files are included in the fingerprint, and
 globs allow workspace manifests to participate.
+
+`summary` puts a project's own line into the block `up` prints at the end,
+where it can be read rather than scrolled back to:
+
+```json
+"summary": {
+  "Login": "bin/rails runner 'puts %Q(https://#{ENV.fetch(%q(DOMAIN))}/admin?lt=#{User.first.auto_login_token})'"
+}
+```
+
+```
+  Database   dev_env_thing_4001_pkliinp6  (port 4001)
+  Login      https://pkliinp6-thing.example.com/admin?lt=1dscvkm5xha5hbp9d8xd
+```
+
+Each command runs once the environment answers, in its worktree and with the
+variables its service runs with, and the last line it prints becomes the value.
+Keep labels to ten characters, the width the fixed rows are padded to. The
+environment is already up by then, so a command that fails or prints nothing
+costs its row and a warning, not the `up`. Every command is one more thing
+between the service starting and the summary appearing: a hook that boots the
+application again is seconds the summary sits silent, and those seconds fall
+outside the reported total.
 
 `after_down` is for resources dev-env does not track — a paired worktree in a
 second repository, say. Hooks run in the environment's worktree with its saved

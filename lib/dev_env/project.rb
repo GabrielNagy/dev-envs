@@ -56,6 +56,15 @@ module DevEnv
     def worktree_files  = @settings["worktree_files"] || {}
     def install_cache   = @settings["install_cache"]
 
+    # Label => command. Each runs at the end of `up` and contributes one row
+    # to its summary.
+    def summary
+      value = @settings["summary"] || {}
+      raise Error, "summary in project configuration must be an object" unless value.is_a?(Hash)
+
+      value
+    end
+
     def public?
       value = @settings.fetch("public", false)
       raise Error, "public in project configuration must be true or false" unless [true, false].include?(value)
