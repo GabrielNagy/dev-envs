@@ -114,6 +114,29 @@ commands to install dependencies, load the schema, migrate and serve, plus any
 untracked files a worktree needs. Nothing in this tool is specific to a project
 or a framework — the defaults `init` writes just happen to suit Rails.
 
+Project configuration can instead remain machine-local under `projects` in
+`~/.config/dev-envs/config.json`, keyed by the primary checkout's repository
+root (`~` is expanded):
+
+```json
+{
+  "projects": {
+    "~/projects/thing": {
+      "name": "thing",
+      "commands": {
+        "server": "bin/rails server -b 127.0.0.1 -p ${PORT}"
+      }
+    }
+  }
+}
+```
+
+The value accepts the same keys as `.dev-env.json` and applies from the primary
+checkout and all of its worktrees. A `.dev-env.json` in the current or primary
+checkout takes precedence as a complete project configuration; the two sources
+are not merged. Commands still run from the environment's worktree, so a helper
+kept outside the repository should be referenced by absolute path.
+
 Keys, all optional except `commands.server`:
 
 | Key | Purpose |
@@ -242,7 +265,7 @@ clean it up by hand. Seed dumps restore into the primary only.
 
 The adapter and the database list are recorded in the environment's state at
 `up`, so `down` works outside the repository and is unaffected by later
-`.dev-env.json` edits.
+project configuration edits.
 
 ## Seed data
 

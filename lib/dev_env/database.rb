@@ -1,16 +1,17 @@
 # frozen_string_literal: true
 
 module DevEnv
-  # The database engine behind each environment: postgres unless .dev-env.json
-  # declares {"database": {"adapter": "mysql"}}. The adapter owns everything
-  # engine-specific — existence checks, create/drop, dump restore and the
-  # default DATABASE_URL — so nothing else needs to branch on the engine.
+  # The database engine behind each environment: postgres unless project
+  # configuration declares {"database": {"adapter": "mysql"}}. The adapter
+  # owns everything engine-specific — existence checks, create/drop, dump
+  # restore and the default DATABASE_URL — so nothing else needs to branch on
+  # the engine.
   class Database
     include Util
 
     def self.for(settings)
       settings ||= {}
-      raise Error, "database in .dev-env.json must be an object" unless settings.is_a?(Hash)
+      raise Error, "database in project configuration must be an object" unless settings.is_a?(Hash)
       adapter = settings.fetch("adapter", "postgres")
       case adapter
       when "postgres", "postgresql" then Postgres.new(settings)

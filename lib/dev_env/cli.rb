@@ -37,7 +37,8 @@ module DevEnv
 
       Environments are created on demand, each served at an HTTPS hostname whose
       leftmost label combines its immutable ID and the project name. Subdomains
-      and which of them sit behind basic auth are declared in .dev-env.json
+      and which of them sit behind basic auth are declared in .dev-env.json or
+      under projects in the machine configuration.
     TEXT
 
     def initialize(config: Config.new)
@@ -96,6 +97,7 @@ module DevEnv
           "port_range" => [4000, 4999],
           "acme_email" => "",
           "acme_dns_provider" => "",
+          "projects" => {},
         }) + "\n")
         ok "Wrote #{@config.path} — set base_domain, acme_email and acme_dns_provider " \
            "(e.g. \"route53\"), then re-run setup. Every project is served under one " \
@@ -123,7 +125,7 @@ module DevEnv
       run("sudo", "systemctl", "restart", "caddy")
 
       systemd.install
-      ok "Ready. Add .dev-env.json to a project with: dev-env init"
+      ok "Ready. Configure a project with `dev-env init` or under projects in #{@config.path}"
     end
 
     def cmd_init(argv)
@@ -161,8 +163,8 @@ module DevEnv
       parser = parse_options!(argv, "Usage: dev-env up [branch] [options]") do |o|
         o.on("--seed PATH", "Dump to restore (default: project seed dump)") { |v| options[:seed] = v; options[:seed_given] = true }
         o.on("--no-seed", "Skip the dump; build the schema from migrations") { options[:no_seed] = true }
-        o.on("--public", "Serve without HTTP basic auth (overrides .dev-env.json)") { options[:public] = true }
-        o.on("--private", "Serve with configured basic auth (overrides .dev-env.json)") { options[:public] = false }
+        o.on("--public", "Serve without HTTP basic auth (overrides project configuration)") { options[:public] = true }
+        o.on("--private", "Serve with configured basic auth (overrides project configuration)") { options[:public] = false }
         o.on("--base REF", "Base ref when the branch does not exist (default: current branch)") { |v| options[:base] = v }
         o.on("--worktree PATH", "Serve an existing checkout instead of creating one") { |v| options[:worktree_path] = v }
       end
@@ -439,8 +441,8 @@ module DevEnv
 
       caddy.ensure_wildcard_site
       # Every recorded environment's site file is rewritten, not just new
-      # ones': a subdomain added to .dev-env.json after an environment came up
-      # would otherwise go unserved until its next `up`.
+      # ones': a subdomain added to project configuration after an environment
+      # came up would otherwise go unserved until its next `up`.
       states = project_states
       states.each do |state|
         caddy.write_site(state["key"], state["domain"], state["port"],
@@ -669,7 +671,8 @@ module DevEnv
           # on the caller's current repository or a later config change.
           state["after_down"] = project.after_down.map { |command| interpolate(command, project.vars_for(state)) }
           # The primary plus any the project declares as extra, resolved here so
-          # `down` drops exactly what `up` created even if .dev-env.json changes.
+          # `down` drops exactly what `up` created even if project configuration
+          # changes.
           state["databases"] = [database, *project.database.extra_names(project.vars_for(state))]
 
           FileUtils.mkdir_p([@config.state_dir, @config.run_dir, project.worktree_root])
@@ -764,7 +767,7 @@ module DevEnv
 
       step "Writing configuration"
       store.write_env(key, app_env)
-      store.write_launcher(key, worktree, commands.fetch("server") { raise Error, "no commands.server in .dev-env.json" })
+      store.write_launcher(key, worktree, commands.fetch("server") { raise Error, "no commands.server in project configuration" })
       systemd.configure_process_manager(key, state["process_manager"])
 
       # Route mutation and reload are one transaction. Without this short lock,

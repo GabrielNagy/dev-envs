@@ -95,15 +95,49 @@ class ProjectTest < Minitest::Test
     assert_includes env["PATH"], "/usr/bin"
   end
 
-  def test_load_discovers_repo_and_prefers_local_settings
+  def test_load_discovers_repo_and_prefers_local_settings_over_global_settings
     repo = Dir.mktmpdir.tap { |d| @tmp_dirs << d }
     system("git", "init", "-q", repo)
+    config = build_config("projects" => { repo => { "name" => "global-thing" } })
     Dir.chdir(repo) do
-      assert_raises(DevEnv::Error) { DevEnv::Project.load(@config) }
+      global_project = DevEnv::Project.load(config)
+      assert_equal "global-thing", global_project.name
+
       File.write(File.join(repo, ".dev-env.json"), JSON.generate("name" => "thing"))
-      project = DevEnv::Project.load(@config)
+      project = DevEnv::Project.load(config)
       assert_equal "thing", project.name
       assert_equal File.realpath(repo), File.realpath(project.root)
+    end
+  end
+
+  def test_global_settings_apply_inside_a_worktree
+    repo = Dir.mktmpdir.tap { |dir| @tmp_dirs << dir }
+    worktree = Dir.mktmpdir.tap { |dir| @tmp_dirs << dir }
+    system("git", "init", "-q", repo)
+    File.write(File.join(repo, "README"), "test\n")
+    system("git", "-C", repo, "add", "README")
+    system("git", "-C", repo, "-c", "user.name=Test", "-c", "user.email=test@example.com",
+           "commit", "-qm", "initial")
+    FileUtils.remove_entry(worktree)
+    system("git", "-C", repo, "worktree", "add", "-q", "-b", "feature", worktree)
+    config = build_config("projects" => { repo => { "name" => "global-thing" } })
+
+    Dir.chdir(worktree) do
+      project = DevEnv::Project.load(config)
+      assert_equal "global-thing", project.name
+      assert_equal File.realpath(repo), File.realpath(project.root)
+    end
+  end
+
+  def test_load_explains_both_project_configuration_options_when_neither_exists
+    repo = Dir.mktmpdir.tap { |d| @tmp_dirs << d }
+    system("git", "init", "-q", repo)
+
+    Dir.chdir(repo) do
+      error = assert_raises(DevEnv::Error) { DevEnv::Project.load(@config) }
+      assert_includes error.message, "dev-env init"
+      assert_includes error.message, "projects"
+      assert_includes error.message, @config.path
     end
   end
 end

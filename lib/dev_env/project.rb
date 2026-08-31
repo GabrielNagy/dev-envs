@@ -1,7 +1,7 @@
 # frozen_string_literal: true
 
 module DevEnv
-  # Everything derived from the repository dev-env runs in: its .dev-env.json
+  # Everything derived from the repository dev-env runs in: its project
   # settings, the hostnames each environment answers on, and the variables
   # interpolated into project commands.
   class Project
@@ -23,9 +23,15 @@ module DevEnv
       # Prefer the config in the checkout being used, so a branch can change
       # it before the primary checkout has the change.
       path = [here, root].map { |dir| File.join(dir, ".dev-env.json") }.find { |p| File.exist?(p) }
-      raise Error, "no .dev-env.json in #{here} — run: dev-env init" if path.nil?
+      settings = path ? JSON.parse(File.read(path)) : config.project_settings(root)
+      unless settings
+        raise Error, "no project configuration for #{here} — run `dev-env init` or add #{root.inspect} " \
+                     "to projects in #{config.path}"
+      end
+      source = path || "projects[#{root.inspect}] in #{config.path}"
+      raise Error, "project configuration in #{source} must be an object" unless settings.is_a?(Hash)
 
-      new(config, root: root, settings: JSON.parse(File.read(path)))
+      new(config, root: root, settings: settings)
     end
 
     attr_reader :root
@@ -40,7 +46,7 @@ module DevEnv
 
     def commands        = @settings["commands"] || {}
     # Recorded into each environment's state at `up`, so `down` can rebuild
-    # the same adapter without reaching the repository's .dev-env.json.
+    # the same adapter without reaching the project configuration.
     def database_settings = @settings["database"]
     def database          = @database ||= Database.for(database_settings)
     def process_manager = @settings["process_manager"]
@@ -52,7 +58,7 @@ module DevEnv
 
     def public?
       value = @settings.fetch("public", false)
-      raise Error, "public in .dev-env.json must be true or false" unless [true, false].include?(value)
+      raise Error, "public in project configuration must be true or false" unless [true, false].include?(value)
 
       value
     end
@@ -83,8 +89,8 @@ module DevEnv
     def subdomains
       @subdomains ||= begin
         raw = @settings["subdomains"] || DEFAULT_SUBDOMAINS
-        raise Error, "subdomains in .dev-env.json must be an object" unless raw.is_a?(Hash)
-        raise Error, "subdomains in .dev-env.json is empty" if raw.empty?
+        raise Error, "subdomains in project configuration must be an object" unless raw.is_a?(Hash)
+        raise Error, "subdomains in project configuration is empty" if raw.empty?
 
         raw.map do |label, spec|
           spec = { "auth" => spec } if [true, false].include?(spec)

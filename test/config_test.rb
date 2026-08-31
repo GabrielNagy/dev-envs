@@ -25,6 +25,22 @@ class ConfigTest < Minitest::Test
     assert_equal File.join(config.home, "envs"), config.state_dir
   end
 
+  def test_project_settings_are_looked_up_by_expanded_repository_root
+    root = Dir.mktmpdir.tap { |dir| (@tmp_dirs ||= []) << dir }
+    equivalent_root = File.join(root, "..", File.basename(root))
+    config = build_config("projects" => { equivalent_root => { "name" => "global-project" } })
+
+    assert_equal({ "name" => "global-project" }, config.project_settings(root))
+    assert_nil config.project_settings("/somewhere/else")
+  end
+
+  def test_projects_must_be_an_object
+    config = build_config("projects" => [])
+
+    error = assert_raises(DevEnv::Error) { config.project_settings("/repo") }
+    assert_includes error.message, "must be an object"
+  end
+
   def test_acme_dns_provider_is_required
     error = assert_raises(DevEnv::Error) { build_config("acme_dns_provider" => "").acme_dns_provider }
     assert_includes error.message, "acme_dns_provider"

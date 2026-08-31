@@ -32,6 +32,24 @@ module DevEnv
     def base_domain     = settings["base_domain"]
     def basic_auth_user = settings.fetch("basic_auth_user", "dev")
 
+    # Project settings may stay machine-local instead of being checked into
+    # the repository. Keys are repository roots; expanding them lets the
+    # common ~/.config form use paths beginning with "~".
+    def project_settings(root)
+      projects = settings.fetch("projects", {})
+      unless projects.is_a?(Hash)
+        raise Error, "projects in #{path} must be an object keyed by repository root"
+      end
+
+      match = projects.find { |configured_root, _| File.expand_path(configured_root) == File.expand_path(root) }
+      return unless match
+
+      project = match.last
+      raise Error, "project configuration for #{match.first} in #{path} must be an object" unless project.is_a?(Hash)
+
+      project
+    end
+
     # Environments get unbounded randomized hostnames, so per-hostname
     # certificates would grow issuance without limit; one DNS-01 wildcard
     # certificate for the base domain is required instead.

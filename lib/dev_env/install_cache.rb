@@ -14,7 +14,7 @@ module DevEnv
 
     def initialize(cache_dir:, project_root:, worktree:, command:, spec:)
       unless spec.is_a?(Hash)
-        raise Error, "install_cache in .dev-env.json must be an object"
+        raise Error, "install_cache in project configuration must be an object"
       end
 
       @worktree = File.expand_path(worktree)
@@ -74,7 +74,7 @@ module DevEnv
     def validate_spec!
       inside_worktree(directory, "install_cache.directory")
       unless @key_patterns.is_a?(Array) && !@key_patterns.empty? && @key_patterns.all? { |item| item.is_a?(String) }
-        raise Error, "install_cache.key_files in .dev-env.json must be a non-empty array of paths or globs"
+        raise Error, "install_cache.key_files in project configuration must be a non-empty array of paths or globs"
       end
       @key_patterns.each { |pattern| validate_relative(pattern, "install_cache.key_files") }
     end
