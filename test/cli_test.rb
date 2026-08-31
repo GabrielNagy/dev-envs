@@ -119,18 +119,41 @@ class CLITest < Minitest::Test
     end
   end
 
-  def test_lifecycle_lock_rejects_a_concurrent_operation
+  def test_environment_lifecycle_locks_allow_different_targets_and_reject_the_same_target
     other = DevEnv::CLI.new(config: @config)
+    different_acquired = false
 
-    @cli.send(:with_lifecycle_lock) do
-      error = assert_raises(DevEnv::Error) { other.send(:with_lifecycle_lock) { flunk "lock was acquired" } }
-      assert_includes error.message, "another dev-env lifecycle operation is running"
+    @cli.send(:with_environment_lifecycle_lock, "/repo", "proj", "feature-a") do
+      other.send(:with_environment_lifecycle_lock, "/repo", "proj", "feature-b") { different_acquired = true }
+      error = assert_raises(DevEnv::Error) do
+        other.send(:with_environment_lifecycle_lock, "/repo", "proj", "feature-a") { flunk "lock was acquired" }
+      end
+      assert_includes error.message, "another dev-env operation is targeting proj/feature-a"
       assert_includes error.message, Process.pid.to_s
     end
 
+    assert different_acquired
     acquired = false
-    other.send(:with_lifecycle_lock) { acquired = true }
-    assert acquired, "the lock should be released when the operation finishes"
+    other.send(:with_environment_lifecycle_lock, "/repo", "proj", "feature-a") { acquired = true }
+    assert acquired, "the target lock should be released when the operation finishes"
+  end
+
+  def test_machine_lifecycle_lock_excludes_targeted_operations_in_both_directions
+    other = DevEnv::CLI.new(config: @config)
+
+    @cli.send(:with_machine_lifecycle_lock) do
+      error = assert_raises(DevEnv::Error) do
+        other.send(:with_environment_lifecycle_lock, "/repo", "proj", "feature") { flunk "lock was acquired" }
+      end
+      assert_includes error.message, "machine-wide dev-env operation"
+    end
+
+    @cli.send(:with_environment_lifecycle_lock, "/repo", "proj", "feature") do
+      error = assert_raises(DevEnv::Error) do
+        other.send(:with_machine_lifecycle_lock) { flunk "lock was acquired" }
+      end
+      assert_includes error.message, "another dev-env lifecycle operation"
+    end
   end
 
   def test_base_domain_change_is_automatic_when_empty_and_requires_down_all_for_environments
@@ -345,7 +368,23 @@ class CLITest < Minitest::Test
     sequence = %w[aaaaaaaa bbbbbbbb]
     @cli.define_singleton_method(:random_environment_id) { sequence.shift }
 
-    assert_equal "bbbbbbbb", @cli.send(:generate_environment_id)
+    selected = @cli.send(:with_environment_id_reservation) { |id| id }
+
+    assert_equal "bbbbbbbb", selected
+    assert_empty sequence
+  end
+
+  def test_generated_ids_retry_in_flight_collisions
+    other = DevEnv::CLI.new(config: @config)
+    @cli.define_singleton_method(:random_environment_id) { "aaaaaaaa" }
+    sequence = %w[aaaaaaaa bbbbbbbb]
+    other.define_singleton_method(:random_environment_id) { sequence.shift }
+
+    @cli.send(:with_environment_id_reservation) do |first|
+      second = other.send(:with_environment_id_reservation) { |id| id }
+      assert_equal "aaaaaaaa", first
+      assert_equal "bbbbbbbb", second
+    end
     assert_empty sequence
   end
 

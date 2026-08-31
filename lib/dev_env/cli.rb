@@ -8,7 +8,7 @@ module DevEnv
 
     COMMANDS = %w[setup init up down list creds logs restart exec activate seed warm].freeze
     COMMAND_ALIASES = { "ls" => "list" }.freeze
-    LIFECYCLE_COMMANDS = %w[setup up down restart seed warm].freeze
+    MACHINE_LIFECYCLE_COMMANDS = %w[setup warm].freeze
 
     USAGE = <<~TEXT
       Usage: dev-env <command> [options]
@@ -59,12 +59,16 @@ module DevEnv
         puts USAGE
       elsif COMMANDS.include?(command)
         operation = proc do
-          if !help_requested && @config.exist? && %w[up creds seed warm].include?(command)
+          if !help_requested && @config.exist? && %w[creds warm].include?(command)
             Caddy.new(@config).ensure_certificate_configuration!
           end
           send("cmd_#{command}", argv)
         end
-        LIFECYCLE_COMMANDS.include?(command) && !help_requested ? with_lifecycle_lock(&operation) : operation.call
+        if MACHINE_LIFECYCLE_COMMANDS.include?(command) && !help_requested
+          with_machine_lifecycle_lock(&operation)
+        else
+          operation.call
+        end
       else
         warn "#{color("Unknown command: #{command}", RED, stream: $stderr)}\n\n#{USAGE}"
         exit 1
@@ -168,102 +172,10 @@ module DevEnv
       options[:base] ||= checked_out_branch || capture("git", "rev-parse", "HEAD")
       options[:public] = project.public? unless options.key?(:public)
 
-      # The exact (project, branch) pair is the logical identity; only one
-      # recorded environment may exist for it.
-      if (existing = project_states.find { |state| state["branch"] == branch })
-        raise Error, "#{project.name} already has an environment for #{branch.inspect} " \
-                     "(https://#{existing['domain']}) — tear it down first: dev-env down #{existing['id']}"
+      with_environment_lifecycle_lock(project.root, project.name, branch) do
+        Caddy.new(@config).ensure_certificate_configuration!
+        bring_up_environment(branch, options, started_at)
       end
-      id = generate_environment_id
-      key = project.key_for(branch, id)
-
-      # Hold the port's socket open while the environment is prepared, so no
-      # other process can claim it during a long build. Released immediately
-      # before the service that binds it starts.
-      reservation = @config.reserve_port(reserved: store.keys.map { |k| store.load(k)["port"] })
-      begin
-        port = reservation.addr[1]
-        database = project.database_for(port, id)
-        # git allows a branch in only one worktree, so a checkout that already exists is the one to
-        # serve, not a conflict to refuse. An agent's worktree is the common case.
-        worktree = File.expand_path(options[:worktree_path] || worktrees.existing_for(branch) ||
-                                    File.join(project.worktree_root, "#{slugify(branch)}--#{id}"))
-        worktrees.verify_adopted!(worktree, branch) if Dir.exist?(worktree)
-        seed = options[:no_seed] ? nil : (options[:seed] || project.default_dump)
-
-        state = {
-          "id" => id, "key" => key, "project" => project.name, "branch" => branch,
-          "domain" => project.domain_for(id),
-          "port" => port, "database" => database, "worktree" => worktree,
-          "project_root" => project.root,
-          # Only a worktree this command created may be torn down by it, on rollback or on `down`.
-          "worktree_owned" => !Dir.exist?(worktree),
-          "basic_auth" => !options[:public] && project.subdomains.any? { |sub| sub["auth"] },
-          "process_manager" => project.process_manager,
-          "database_settings" => project.database_settings,
-          "created_at" => Time.now.utc.iso8601,
-        }
-        # Persist the fully resolved commands so teardown by ID never depends
-        # on the caller's current repository or a later config change.
-        state["after_down"] = project.after_down.map { |command| interpolate(command, project.vars_for(state)) }
-        # The primary plus any the project declares as extra, resolved here so
-        # `down` drops exactly what `up` created even if .dev-env.json changes.
-        state["databases"] = [database, *project.database.extra_names(project.vars_for(state))]
-
-        FileUtils.mkdir_p([@config.state_dir, @config.run_dir, project.worktree_root])
-        systemd.install unless systemd.installed?
-
-        # A half-built environment is worse than none: undo whatever was
-        # created if a later step fails, so a retry starts clean.
-        rollback = []
-        begin
-          if state["worktree_owned"]
-            step "Creating worktree #{worktree} for #{branch}"
-            worktrees.create(worktree, branch, options[:base])
-            rollback << ["remove worktree #{worktree}", -> { worktrees.remove(worktree, force: true, quiet: true) }]
-          else
-            step "Using existing worktree #{worktree} for #{branch}"
-          end
-          worktrees.write_files(worktree, state["domain"])
-
-          db = database_for(state)
-          state["databases"].each do |name|
-            step "Creating database #{name}"
-            raise Error, "database #{name} already exists" if db.exists?(name)
-            db.create(name)
-            rollback << ["drop database #{name}", -> { db.drop(name, quiet: true) }]
-          end
-
-          build_environment(state, seed, options, reservation)
-        rescue StandardError => error
-          note "Failed partway through — rolling back"
-          failures = []
-          stopped = try_cleanup(failures, "stop #{systemd.unit(key)}") { stop_service!(key) }
-          if File.exist?(caddy.site_path(key))
-            try_cleanup(failures, "remove Caddy site") do
-              caddy.delete_site(key)
-              caddy.reload
-            end
-          end
-          rollback.reverse_each { |description, undo| try_cleanup(failures, description, &undo) } if stopped
-          note "Service is still running; leaving its databases and worktree intact" unless stopped
-          try_cleanup(failures, "remove systemd override") { systemd.configure_process_manager(key, nil) } if stopped
-          try_cleanup(failures, "remove password") { secrets.delete_password(key) } if failures.empty?
-
-          if failures.empty?
-            store.delete(key)
-          else
-            store.save(key, state)
-            note "Rollback incomplete (#{failures.join('; ')}); state kept for: dev-env down #{id}"
-          end
-          raise error
-        end
-      ensure
-        reservation.close unless reservation.closed?
-      end
-
-      ok "#{project.name}/#{branch} is up"
-      print_summary(key, total: monotonic_time - started_at)
     end
 
     # ------------------------------------------------------------- lifecycle
@@ -280,23 +192,7 @@ module DevEnv
 
       if options.delete(:all)
         raise Error, "#{parser.banner}\n  an environment ID cannot be combined with --all" unless argv.empty?
-
-        keys = store.keys
-        return puts("No environments.") if keys.empty?
-
-        failures = []
-        keys.each do |key|
-          teardown_environment(key, options, reload_caddy: false)
-        rescue Error => error
-          failures << [key, error]
-          note "Failed to remove #{key}: #{error.message}"
-        end
-        teardown_caddy.reload
-        unless failures.empty?
-          raise Error, "failed to remove #{failures.length} environment#{'s' unless failures.one?}: " \
-                       "#{failures.map(&:first).join(', ')}"
-        end
-        return ok("All environments removed")
+        return with_machine_lifecycle_lock { teardown_all_environments(options) }
       end
 
       id = optional_argument!(argv, parser.banner)
@@ -305,7 +201,29 @@ module DevEnv
             else
               environment_key_for(id) || raise(Error, "no environment #{id.inspect} (try: dev-env list)")
             end
-      teardown_environment(key, options)
+      state = store.load(key)
+      with_environment_lifecycle_lock(state["project_root"], state["project"], state["branch"]) do
+        teardown_environment(key, options)
+      end
+    end
+
+    def teardown_all_environments(options)
+      keys = store.keys
+      return puts("No environments.") if keys.empty?
+
+      failures = []
+      keys.each do |key|
+        teardown_environment(key, options, reload_caddy: false)
+      rescue Error => error
+        failures << [key, error]
+        note "Failed to remove #{key}: #{error.message}"
+      end
+      with_caddy_lock { teardown_caddy.reload }
+      unless failures.empty?
+        raise Error, "failed to remove #{failures.length} environment#{'s' unless failures.one?}: " \
+                     "#{failures.map(&:first).join(', ')}"
+      end
+      ok "All environments removed"
     end
 
     def teardown_environment(key, options, reload_caddy: true)
@@ -322,11 +240,13 @@ module DevEnv
       stopped = try_cleanup(failures, "stop #{systemd.unit(key)}") { stop_service!(key) }
 
       try_cleanup(failures, "remove Caddy site") do
-        step "Removing Caddy site"
-        # The wildcard certificate is shared by every project, so removing this
-        # hostname's route costs nothing at the next `up`.
-        teardown_caddy.delete_site(key)
-        teardown_caddy.reload if reload_caddy
+        with_caddy_lock do
+          step "Removing Caddy site"
+          # The wildcard certificate is shared by every project, so removing this
+          # hostname's route costs nothing at the next `up`.
+          teardown_caddy.delete_site(key)
+          teardown_caddy.reload if reload_caddy
+        end
       end
 
       if stopped
@@ -350,7 +270,9 @@ module DevEnv
         elsif owned
           try_cleanup(failures, "remove worktree #{state['worktree']}") do
             step "Removing worktree #{state['worktree']}"
-            Worktrees.remove(state["worktree"], root: state["project_root"], force: options[:force])
+            with_project_lock(state["project_root"]) do
+              Worktrees.remove(state["worktree"], root: state["project_root"], force: options[:force])
+            end
           end
         else
           note "Leaving worktree #{state['worktree']} — dev-env did not create it"
@@ -372,11 +294,11 @@ module DevEnv
       parser = parse_options!(argv, "Usage: dev-env list")
       reject_arguments!(argv, parser.banner)
 
-      keys = store.keys
-      return puts("No environments.") if keys.empty?
+      states = store.states
+      return puts("No environments.") if states.empty?
 
-      rows = keys.map do |key|
-        state = store.load(key)
+      rows = states.map do |state|
+        key = state["key"]
         [state["id"].to_s, state["project"].to_s, state["branch"].to_s,
          state["port"].to_s, systemd.status(key), "https://#{state['domain']}"]
       end
@@ -436,9 +358,12 @@ module DevEnv
       parser = parse_options!(argv, "Usage: dev-env restart [target]")
       key = resolve_target(argv, parser.banner)
       state = store.load(key)
-      systemd.configure_process_manager(key, process_manager_for(state))
-      systemd.systemctl("restart", systemd.unit(key))
-      ok(wait_for_boot(state["port"]) ? "Restarted #{key}" : "Restarted #{key}, not answering yet")
+      with_environment_lifecycle_lock(state["project_root"], state["project"], state["branch"]) do
+        state = store.load(key)
+        systemd.configure_process_manager(key, process_manager_for(state))
+        systemd.systemctl("restart", systemd.unit(key))
+        ok(wait_for_boot(state["port"]) ? "Restarted #{key}" : "Restarted #{key}, not answering yet")
+      end
     end
 
     def cmd_exec(argv)
@@ -481,27 +406,31 @@ module DevEnv
       end
       key = resolve_target(argv, parser.banner)
       state = store.load(key)
-      dump = options[:seed] || project.default_dump
-      raise Error, "seed dump not found: #{dump}" unless File.exist?(dump)
+      with_environment_lifecycle_lock(state["project_root"], state["project"], state["branch"]) do
+        Caddy.new(@config).ensure_certificate_configuration!
+        state = store.load(key)
+        dump = options[:seed] || project.default_dump
+        raise Error, "seed dump not found: #{dump}" unless File.exist?(dump)
 
-      vars = project.vars_for(state)
-      app_env = project.app_env_for(vars)
+        vars = project.vars_for(state)
+        app_env = project.app_env_for(vars)
 
-      systemd.configure_process_manager(key, process_manager_for(state))
-      stop_service!(key, command: "stop", message: "Stopping #{systemd.unit(key)} while the database is rebuilt")
+        systemd.configure_process_manager(key, process_manager_for(state))
+        stop_service!(key, command: "stop", message: "Stopping #{systemd.unit(key)} while the database is rebuilt")
 
-      db = database_for(state)
-      step "Recreating #{databases_for(state).join(', ')}"
-      databases_for(state).each do |name|
-        db.drop(name)
-        db.create(name)
+        db = database_for(state)
+        step "Recreating #{databases_for(state).join(', ')}"
+        databases_for(state).each do |name|
+          db.drop(name)
+          db.create(name)
+        end
+        restore_dump(db, state["database"], dump, state["worktree"], app_env, vars)
+
+        project_command(interpolate(project.commands, vars)["migrate"], "Running migrations", state["worktree"], app_env)
+
+        systemd.systemctl("start", systemd.unit(key))
+        ok(wait_for_boot(state["port"]) ? "Reseeded #{key}" : "Reseeded #{key}, not answering yet")
       end
-      restore_dump(db, state["database"], dump, state["worktree"], app_env, vars)
-
-      project_command(interpolate(project.commands, vars)["migrate"], "Running migrations", state["worktree"], app_env)
-
-      systemd.systemctl("start", systemd.unit(key))
-      ok(wait_for_boot(state["port"]) ? "Reseeded #{key}" : "Reseeded #{key}, not answering yet")
     end
 
     def cmd_warm(argv)
@@ -577,18 +506,54 @@ module DevEnv
       raise Error, "#{systemd.unit(key)} did not stop (#{status.empty? ? 'unknown' : status})" unless %w[inactive failed].include?(status)
     end
 
-    def with_lifecycle_lock
-      FileUtils.mkdir_p(@config.home)
-      File.open(@config.lock_path, File::RDWR | File::CREAT, 0o600) do |lock|
-        unless lock.flock(File::LOCK_EX | File::LOCK_NB)
-          owner = lock.read.strip
+    # Targeted operations share the machine gate, then exclusively lock their
+    # logical (repository, branch) environment. Machine-wide operations take
+    # the gate exclusively, so setup and down --all still see a stable machine.
+    def with_machine_lifecycle_lock(&block)
+      with_file_lock(@config.lock_path, File::LOCK_EX,
+                     conflict: "another dev-env lifecycle operation is running", &block)
+    end
+
+    def with_environment_lifecycle_lock(project_root, project_name, branch, &block)
+      with_file_lock(@config.lock_path, File::LOCK_SH,
+                     conflict: "a machine-wide dev-env operation is running") do
+        root = project_root.to_s.empty? ? "project:#{project_name}" : File.expand_path(project_root)
+        identity = "#{root}\0#{branch}"
+        path = scoped_lock_path("environments", identity)
+        with_file_lock(path, File::LOCK_EX,
+                       conflict: "another dev-env operation is targeting #{project_name}/#{branch}",
+                       record_owner: true, &block)
+      end
+    end
+
+    # Shared resources are locked only while they are mutated. Different
+    # environments can install, migrate and stop services in parallel.
+    def with_caddy_lock(&block) =
+      with_file_lock(scoped_lock_path("resources", "caddy"), File::LOCK_EX, &block)
+
+    def with_project_lock(project_root, &block) =
+      with_file_lock(scoped_lock_path("projects", File.expand_path(project_root)), File::LOCK_EX, &block)
+
+    def scoped_lock_path(scope, identity)
+      File.join(@config.home, "locks", scope, "#{Digest::SHA256.hexdigest(identity)}.lock")
+    end
+
+    def with_file_lock(path, mode, conflict: nil, record_owner: false)
+      FileUtils.mkdir_p(File.dirname(path))
+      File.open(path, File::RDWR | File::CREAT, 0o600) do |lock|
+        flags = conflict ? mode | File::LOCK_NB : mode
+        unless lock.flock(flags)
+          lock.rewind
+          owner = record_owner ? lock.read.strip : ""
           detail = owner.empty? ? "" : " (PID #{owner})"
-          raise Error, "another dev-env lifecycle operation is running#{detail}"
+          raise Error, "#{conflict}#{detail}"
         end
 
-        lock.truncate(0)
-        lock.write(Process.pid.to_s)
-        lock.flush
+        if record_owner
+          lock.truncate(0)
+          lock.write(Process.pid.to_s)
+          lock.flush
+        end
         yield
       end
     end
@@ -631,7 +596,7 @@ module DevEnv
     def prepare_base_domain_change!
       return if Caddy.new(@config).certificate_configuration_matches?
 
-      count = store.keys.length
+      count = store.states.length
       return if count.zero?
       raise Error, "base_domain cannot be changed while #{count} environment#{'s' unless count == 1} exist. " \
                    "Run `dev-env down --all`, then `dev-env setup`"
@@ -639,19 +604,136 @@ module DevEnv
 
     # Every recorded environment of the current project.
     def project_states
-      store.keys.map { |key| store.load(key) }.select { |state| state["project"] == project.name }
+      store.states.select { |state| state["project"] == project.name }
     end
 
-    # The ID is global because it names machine-wide artifacts. Retry the
-    # generated value if it belongs to a recorded environment.
-    def generate_environment_id
+    # The ID is global because it names machine-wide artifacts. Hold its own
+    # lock until the environment is recorded, so concurrent ups cannot reserve
+    # the same random value before either state file exists.
+    def with_environment_id_reservation
       loop do
         id = random_environment_id
-        return id unless environment_key_for(id)
+        path = scoped_lock_path("ids", id)
+        FileUtils.mkdir_p(File.dirname(path))
+        File.open(path, File::RDWR | File::CREAT, 0o600) do |lock|
+          next unless lock.flock(File::LOCK_EX | File::LOCK_NB)
+          next if environment_key_for(id)
+
+          return yield id
+        end
       end
     end
 
     def random_environment_id = SecureRandom.random_number(36**8).to_s(36).rjust(8, "0")
+
+    def bring_up_environment(branch, options, started_at)
+      # The exact (project, branch) pair is the logical identity; only one
+      # recorded environment may exist for it. The caller holds that identity's
+      # lock, so another up or down cannot change the answer underneath us.
+      if (existing = project_states.find { |state| state["branch"] == branch })
+        raise Error, "#{project.name} already has an environment for #{branch.inspect} " \
+                     "(https://#{existing['domain']}) — tear it down first: dev-env down #{existing['id']}"
+      end
+
+      with_environment_id_reservation do |id|
+        key = project.key_for(branch, id)
+
+        # Hold the port's socket open while the environment is prepared, so no
+        # other process can claim it during a long build. Released immediately
+        # before the service that binds it starts.
+        reserved_ports = store.states.filter_map { |state| state["port"] }
+        reservation = @config.reserve_port(reserved: reserved_ports)
+        begin
+          port = reservation.addr[1]
+          database = project.database_for(port, id)
+          # Git allows a branch in only one worktree, so a checkout that already exists is the one to
+          # serve, not a conflict to refuse. An agent's worktree is the common case.
+          worktree = File.expand_path(options[:worktree_path] || worktrees.existing_for(branch) ||
+                                      File.join(project.worktree_root, "#{slugify(branch)}--#{id}"))
+          worktrees.verify_adopted!(worktree, branch) if Dir.exist?(worktree)
+          seed = options[:no_seed] ? nil : (options[:seed] || project.default_dump)
+
+          state = {
+            "id" => id, "key" => key, "project" => project.name, "branch" => branch,
+            "domain" => project.domain_for(id),
+            "port" => port, "database" => database, "worktree" => worktree,
+            "project_root" => project.root,
+            # Only a worktree this command created may be torn down by it, on rollback or on `down`.
+            "worktree_owned" => !Dir.exist?(worktree),
+            "basic_auth" => !options[:public] && project.subdomains.any? { |sub| sub["auth"] },
+            "process_manager" => project.process_manager,
+            "database_settings" => project.database_settings,
+            "created_at" => Time.now.utc.iso8601,
+          }
+          # Persist the fully resolved commands so teardown by ID never depends
+          # on the caller's current repository or a later config change.
+          state["after_down"] = project.after_down.map { |command| interpolate(command, project.vars_for(state)) }
+          # The primary plus any the project declares as extra, resolved here so
+          # `down` drops exactly what `up` created even if .dev-env.json changes.
+          state["databases"] = [database, *project.database.extra_names(project.vars_for(state))]
+
+          FileUtils.mkdir_p([@config.state_dir, @config.run_dir, project.worktree_root])
+          systemd.install unless systemd.installed?
+
+          # A half-built environment is worse than none: undo whatever was
+          # created if a later step fails, so a retry starts clean.
+          rollback = []
+          begin
+            with_project_lock(project.root) do
+              if state["worktree_owned"]
+                step "Creating worktree #{worktree} for #{branch}"
+                worktrees.create(worktree, branch, options[:base])
+                rollback << ["remove worktree #{worktree}", lambda do
+                  with_project_lock(project.root) { worktrees.remove(worktree, force: true, quiet: true) }
+                end]
+              else
+                step "Using existing worktree #{worktree} for #{branch}"
+              end
+              worktrees.write_files(worktree, state["domain"])
+            end
+
+            db = database_for(state)
+            state["databases"].each do |name|
+              step "Creating database #{name}"
+              raise Error, "database #{name} already exists" if db.exists?(name)
+              db.create(name)
+              rollback << ["drop database #{name}", -> { db.drop(name, quiet: true) }]
+            end
+
+            build_environment(state, seed, options, reservation)
+          rescue StandardError => error
+            note "Failed partway through — rolling back"
+            failures = []
+            stopped = try_cleanup(failures, "stop #{systemd.unit(key)}") { stop_service!(key) }
+            if File.exist?(caddy.site_path(key))
+              try_cleanup(failures, "remove Caddy site") do
+                with_caddy_lock do
+                  caddy.delete_site(key)
+                  caddy.reload
+                end
+              end
+            end
+            rollback.reverse_each { |description, undo| try_cleanup(failures, description, &undo) } if stopped
+            note "Service is still running; leaving its databases and worktree intact" unless stopped
+            try_cleanup(failures, "remove systemd override") { systemd.configure_process_manager(key, nil) } if stopped
+            try_cleanup(failures, "remove password") { secrets.delete_password(key) } if failures.empty?
+
+            if failures.empty?
+              store.delete(key)
+            else
+              store.save(key, state)
+              note "Rollback incomplete (#{failures.join('; ')}); state kept for: dev-env down #{id}"
+            end
+            raise error
+          end
+        ensure
+          reservation.close unless reservation.closed?
+        end
+
+        ok "#{project.name}/#{branch} is up"
+        print_summary(key, total: monotonic_time - started_at)
+      end
+    end
 
     def build_environment(state, seed, options, reservation)
       key, branch, worktree, domain, port, database =
@@ -684,12 +766,17 @@ module DevEnv
       store.write_env(key, app_env)
       store.write_launcher(key, worktree, commands.fetch("server") { raise Error, "no commands.server in .dev-env.json" })
       systemd.configure_process_manager(key, state["process_manager"])
-      caddy.ensure_wildcard_site
-      caddy.write_site(key, domain, port, password)
-      store.save(key, state)
 
-      step "Reloading Caddy"
-      caddy.reload
+      # Route mutation and reload are one transaction. Without this short lock,
+      # concurrent reloads could apply an older Caddy snapshot last.
+      with_caddy_lock do
+        caddy.ensure_wildcard_site
+        caddy.write_site(key, domain, port, password)
+        store.save(key, state)
+
+        step "Reloading Caddy"
+        caddy.reload
+      end
 
       # State is persisted, so no other `up` can pick this port from it; only
       # now may the socket be released for the service to bind.
@@ -777,7 +864,7 @@ module DevEnv
     end
 
     def environment_key_for(id)
-      store.keys.find { |key| store.load(key)["id"] == id }
+      store.states.find { |state| state["id"] == id }&.fetch("key")
     end
 
     # The branch checked out in the current directory, so `up` run inside a
@@ -794,11 +881,11 @@ module DevEnv
     # elsewhere.
     def implicit_key
       here = File.realpath(Dir.pwd)
-      match = store.keys.filter_map do |key|
-        worktree = store.load(key)["worktree"].to_s
+      match = store.states.filter_map do |state|
+        worktree = state["worktree"].to_s
         next if worktree.empty? || !Dir.exist?(worktree)
         root = File.realpath(worktree)
-        [key, root] if here == root || here.start_with?(root + File::SEPARATOR)
+        [state["key"], root] if here == root || here.start_with?(root + File::SEPARATOR)
       end.max_by { |_, root| root.length }
       return match.first if match
       active = ENV["DEV_ENV_ACTIVE"].to_s

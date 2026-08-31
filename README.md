@@ -46,6 +46,12 @@ systemd units such as
 `dev-env@sample--worktree-silver-cloud-2a0f--epxrnilj.service`. The concise ID is
 the URL component and command-line selector.
 
+Lifecycle commands for different environments may run concurrently. Commands
+that target the same repository and branch exclude one another; `setup`,
+`warm`, and `down --all` are machine-wide and run only when no targeted
+lifecycle operation is active. Updates to shared Git metadata and Caddy routing
+are serialized briefly without holding up the rest of each operation.
+
 ## Setting up a machine
 
 Needs postgres, Caddy, and one `*.<base domain>` wildcard DNS record pointing at

@@ -15,8 +15,10 @@ class StoreTest < Minitest::Test
 
   def test_state_roundtrip_keys_and_delete
     assert_raises(DevEnv::Error) { @store.load(KEY) }
-    @store.save(KEY, { "branch" => "feature", "port" => 4001 })
+    state = { "branch" => "feature", "port" => 4001 }
+    @store.save(KEY, state)
     assert_equal [KEY], @store.keys
+    assert_equal [state], @store.states
     assert_equal 4001, @store.load(KEY)["port"]
     @store.delete(KEY)
     refute @store.exist?(KEY)

@@ -19,6 +19,17 @@ module DevEnv
 
     def keys = Dir.glob(File.join(@state_dir, "*.json")).map { |f| File.basename(f, ".json") }.sort
 
+    # A lifecycle operation may remove an unrelated environment after globbing
+    # but before it is read. Atomic writes guarantee complete JSON; disappearing
+    # files are simply absent from this snapshot.
+    def states
+      Dir.glob(File.join(@state_dir, "*.json")).sort.filter_map do |path|
+        JSON.parse(File.read(path))
+      rescue Errno::ENOENT
+        nil
+      end
+    end
+
     def load(key)
       raise Error, "no environment #{key.inspect} (try: dev-env list)" unless exist?(key)
       JSON.parse(File.read(state_path(key)))
