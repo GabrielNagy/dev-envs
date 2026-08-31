@@ -14,11 +14,17 @@ class WorktreesTest < Minitest::Test
     @project = build_project(@config,
                              { "name" => "proj",
                                "link_from_root" => [".env.key"],
-                               "worktree_files" => { "config/local.rb" => "domain '${DOMAIN}'" } },
+                               "worktree_files" => {
+                                 "config/local.rb" => ["domain '${DOMAIN}'", "database '${DATABASE}'"],
+                               } },
                              root: @repo)
     @worktrees = DevEnv::Worktrees.new(@project)
     @path = File.join(Dir.mktmpdir.tap { @tmp_dirs << _1 }, "wt-feature")
   end
+
+  # write_files interpolates the variables `up` builds for every consumer, not
+  # the domain alone.
+  def vars = { "DOMAIN" => "pkliinp6-proj.example.com", "DATABASE" => "dev_env_proj_41000_pkliinp6" }
 
   def create_worktree(branch = "feature", base = "main")
     capture_subprocess_io { @worktrees.create(@path, branch, base) }
@@ -61,14 +67,15 @@ class WorktreesTest < Minitest::Test
     File.write(File.join(@repo, ".env.key"), "sekret")
     create_worktree
 
-    capture_io { @worktrees.write_files(@path, "pkliinp6-proj.example.com") }
+    capture_io { @worktrees.write_files(@path, vars) }
 
     assert_equal File.join(@repo, ".env.key"), File.readlink(File.join(@path, ".env.key"))
-    assert_equal "domain 'pkliinp6-proj.example.com'\n", File.read(File.join(@path, "config/local.rb"))
+    assert_equal "domain 'pkliinp6-proj.example.com'\ndatabase 'dev_env_proj_41000_pkliinp6'\n",
+                 File.read(File.join(@path, "config/local.rb"))
     assert_includes File.read(File.join(@repo, ".git", "info", "exclude")), "config/local.rb"
 
     # Writing into the primary checkout itself must not clobber the real file.
-    capture_io { @worktrees.write_files(@repo, "pkliinp6-proj.example.com") }
+    capture_io { @worktrees.write_files(@repo, vars) }
     refute File.symlink?(File.join(@repo, ".env.key"))
     assert_equal "sekret", File.read(File.join(@repo, ".env.key"))
   end
