@@ -692,7 +692,7 @@ module DevEnv
               else
                 step "Using existing worktree #{worktree} for #{branch}"
               end
-              worktrees.write_files(worktree, state["domain"])
+              worktrees.write_files(worktree, project.vars_for(state))
             end
 
             db = database_for(state)

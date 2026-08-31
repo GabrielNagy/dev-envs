@@ -77,8 +77,8 @@ module DevEnv
     # Untracked files a project needs in every worktree: gitignored secrets it
     # cannot check in, or settings branches predating a change would otherwise
     # lack.
-    def write_files(worktree, domain)
-      vars = @project.domain_vars(domain).merge("ROOT" => @project.root)
+    def write_files(worktree, vars)
+      vars = vars.merge("ROOT" => @project.root)
 
       @project.link_from_root.each do |pattern|
         Dir.glob(File.join(@project.root, pattern)).each do |source|
