@@ -3,12 +3,8 @@
 module DevEnv
   # A seeded database kept on the server and cloned into each new
   # environment, so the cost of filling one is paid once a day rather than
-  # once per environment.
-  #
-  # The project's own command fills it. A project that already knows how to
-  # fetch and load its seed data keeps that where it is and points it at the
-  # template through ${DATABASE_URL}; nothing about the dump's location,
-  # format or freshness is repeated here.
+  # once per environment. The project's own command fills it, pointed at the
+  # template through ${DATABASE_URL}.
   class SeedTemplate
     include Util
 
@@ -33,13 +29,8 @@ module DevEnv
       @parent = File.join(cache_dir, "seed-templates")
     end
 
-    # Clone the template into `name`, building it first when it is missing or
-    # stale.
-    #
-    # One lock spans both. A rebuild dropping the template part way through
-    # somebody else's clone would fail that environment, so concurrent `up`
-    # commands clone one after another: a few seconds each, against an `up`
-    # that rolls back.
+    # One lock spans building and cloning: a rebuild dropping the template
+    # part way through somebody else's clone would fail that environment.
     def clone_into(db, name, worktree, env, vars)
       resource = db.resource_identity(database)
       with_lock(resource) do

@@ -1,7 +1,6 @@
 # frozen_string_literal: true
 
 module DevEnv
-  # Git worktree lifecycle and the untracked files each worktree needs.
   class Worktrees
     include Util
 
@@ -9,8 +8,6 @@ module DevEnv
       @project = project
     end
 
-    # The path of the worktree this repository already has checked out on
-    # `branch`, or nil.
     def existing_for(branch)
       path = nil
       capture("git", "-C", @project.root, "worktree", "list", "--porcelain").each_line do |line|
@@ -21,9 +18,9 @@ module DevEnv
       nil
     end
 
-    # A checkout dev-env did not create is only usable if it really is this
-    # repository's, on this branch. Serving someone else's directory would be
-    # silently wrong in both directions.
+    # Serving someone else's directory would be silently wrong in both
+    # directions, so an adopted checkout must be this repository's, on this
+    # branch.
     def verify_adopted!(worktree, branch)
       common = capture("git", "-C", worktree, "rev-parse", "--path-format=absolute", "--git-common-dir")
       raise Error, "#{worktree} is not a git worktree" if common.empty?
@@ -63,9 +60,6 @@ module DevEnv
     def self.remove(worktree, root:, force: false, quiet: false)
       return true unless Dir.exist?(worktree)
 
-      # Removal can be driven entirely by an environment record, including
-      # `down --all` run outside any repository, because the owning project
-      # root is persisted alongside the worktree path.
       command = ["git", "-C", root, "worktree", "remove"]
       command << "--force" if force
       Util.run(*command, worktree, quiet: quiet)
@@ -74,34 +68,9 @@ module DevEnv
     def remove(worktree, force: false, quiet: false) =
       self.class.remove(worktree, root: @project.root, force: force, quiet: quiet)
 
-    # Untracked files a project needs in every worktree: gitignored secrets it
-    # cannot check in, or settings branches predating a change would otherwise
-    # lack.
     def write_files(worktree, vars)
-      vars = vars.merge("ROOT" => @project.root)
-
-      @project.link_from_root.each do |pattern|
-        Dir.glob(File.join(@project.root, pattern)).each do |source|
-          target = File.join(worktree, source.delete_prefix(@project.root + "/"))
-          # When the adopted worktree is the primary checkout itself, source
-          # and target coincide, and ln_sf would replace the real file with a
-          # symlink to itself, destroying it.
-          next if File.expand_path(target) == File.expand_path(source)
-
-          FileUtils.mkdir_p(File.dirname(target))
-          FileUtils.ln_sf(source, target)
-        end
-      end
-
-      @project.worktree_files.each do |relative, spec|
-        spec = { "content" => spec } if spec.is_a?(Array) || spec.is_a?(String)
-        guard = spec["unless_file_contains"]
-        if guard && File.exist?(File.join(worktree, guard["file"])) &&
-           File.read(File.join(worktree, guard["file"])).include?(guard["text"])
-          next
-        end
-
-        body = Array(spec["content"]).join("\n")
+      @project.worktree_files.each do |relative, content|
+        body = Array(content).join("\n")
         target = File.join(worktree, relative)
         FileUtils.mkdir_p(File.dirname(target))
         atomic_write(target, interpolate(body, vars) + "\n")

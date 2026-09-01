@@ -1,10 +1,10 @@
 # frozen_string_literal: true
 
 module DevEnv
-  # Copies a successfully installed dependency directory into a machine-local
-  # snapshot and uses it to seed new worktrees with the same dependency inputs.
-  # The project's install command still runs after every restore and remains
-  # the authority on whether the resulting installation is valid.
+  # Seeds new worktrees from a machine-local snapshot of the last successful
+  # install with the same dependency inputs. The project's install command
+  # still runs after every restore and remains the authority on whether the
+  # result is valid.
   class InstallCache
     include Util
 

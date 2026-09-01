@@ -1,14 +1,17 @@
 # frozen_string_literal: true
 
 module DevEnv
-  # The on-disk record of one environment: its state JSON, the environment
-  # file its service runs with, and the generated launcher script.
+  # The on-disk record of one environment: state JSON, the environment file
+  # its service runs with, the generated launcher script and the basic-auth
+  # password. Everything lives exactly as long as the record and is removed
+  # together on `down`.
   class Store
     include Util
 
-    def initialize(state_dir:, run_dir:)
+    def initialize(state_dir:, run_dir:, secret_dir:)
       @state_dir = state_dir
       @run_dir = run_dir
+      @secret_dir = secret_dir
     end
 
     def state_path(key) = File.join(@state_dir, "#{key}.json")
@@ -20,8 +23,8 @@ module DevEnv
     def keys = Dir.glob(File.join(@state_dir, "*.json")).map { |f| File.basename(f, ".json") }.sort
 
     # A lifecycle operation may remove an unrelated environment after globbing
-    # but before it is read. Atomic writes guarantee complete JSON; disappearing
-    # files are simply absent from this snapshot.
+    # but before it is read; disappearing files are simply absent from this
+    # snapshot.
     def states
       Dir.glob(File.join(@state_dir, "*.json")).sort.filter_map do |path|
         JSON.parse(File.read(path))
@@ -57,6 +60,15 @@ module DevEnv
       SH
     end
 
-    def delete(key) = FileUtils.rm_f([state_path(key), env_path(key), run_path(key)])
+    def password_path(key) = File.join(@secret_dir, "#{key}.password")
+
+    def password?(key) = File.exist?(password_path(key))
+
+    def password_for(key)
+      atomic_write(password_path(key), SecureRandom.alphanumeric(16), mode: 0o600) unless password?(key)
+      File.read(password_path(key)).strip
+    end
+
+    def delete(key) = FileUtils.rm_f([state_path(key), env_path(key), run_path(key), password_path(key)])
   end
 end

@@ -25,7 +25,7 @@ module DevEnv
         logs [target] [-f]
                           Show or follow service logs
         restart [target]  Restart the service
-        seed [target]     Rebuild the database from the seed template or dump
+        seed [target]     Rebuild the database from the seed template
         warm              Rewrite recorded Caddy sites and pre-issue certificates
 
       A target is an environment ID or an exact branch in the current project.
@@ -84,7 +84,7 @@ module DevEnv
 
       ip = capture("sh", "-c", "ip -4 route get 1.1.1.1 2>/dev/null | grep -oP 'src \\K[0-9.]+'")
       raise Error, "could not detect a public IPv4 address" if ip.empty?
-      FileUtils.mkdir_p([@config.home, @config.state_dir, @config.dump_dir, @config.run_dir, @config.secret_dir])
+      FileUtils.mkdir_p([@config.home, @config.state_dir, @config.run_dir, @config.secret_dir])
       FileUtils.chmod(0o700, @config.secret_dir)
 
       unless @config.exist?
@@ -145,7 +145,6 @@ module DevEnv
         "env" => { "RAILS_ENV" => "development" },
         "public" => false,
         "subdomains" => { "" => { "auth" => true }, "app" => { "auth" => true } },
-        "after_restore" => [],
         "after_down" => [],
         "worktree_files" => {},
       }) + "\n")
@@ -158,8 +157,7 @@ module DevEnv
       started_at = monotonic_time
       options = {}
       parser = parse_options!(argv, "Usage: dev-env up [branch] [options]") do |o|
-        o.on("--seed PATH", "Dump to restore (default: project seed dump)") { |v| options[:seed] = v }
-        o.on("--no-seed", "Skip the dump; build the schema from migrations") { options[:no_seed] = true }
+        o.on("--no-seed", "Skip the seed template; build the schema from the project's commands") { options[:no_seed] = true }
         o.on("--public", "Serve without HTTP basic auth (overrides project configuration)") { options[:public] = true }
         o.on("--private", "Serve with configured basic auth (overrides project configuration)") { options[:public] = false }
         o.on("--base REF", "Base ref when the branch does not exist (default: current branch)") { |v| options[:base] = v }
@@ -284,7 +282,6 @@ module DevEnv
 
       raise Error, "incomplete teardown; state kept: #{failures.join('; ')}" unless failures.empty?
 
-      secrets.delete_password(key)
       store.delete(key)
       ok "#{state['project']}/#{state['branch']} removed"
     end
@@ -322,10 +319,10 @@ module DevEnv
       key = target ? resolve(target) : implicit_key
       if key.nil?
         project_states.each do |state|
-          next unless secrets.password?(state["key"])
+          next unless store.password?(state["key"])
           host = project.host_for(state["domain"], guarded.first["label"])
           puts "#{color(state['branch'], BOLD)}  #{color("https://#{host}", CYAN)}  " \
-               "#{@config.basic_auth_user} / #{color(secrets.password_for(state['key']), YELLOW)}"
+               "#{@config.basic_auth_user} / #{color(store.password_for(state['key']), YELLOW)}"
         end
         return
       end
@@ -341,7 +338,7 @@ module DevEnv
         puts "#{color(label, BOLD)}     #{color("https://#{project.host_for(domain, sub['label'])}", CYAN)}"
       end
       puts "#{color('Username', BOLD)} #{@config.basic_auth_user}"
-      puts "#{color('Password', BOLD)} #{color(secrets.password_for(key), YELLOW)}"
+      puts "#{color('Password', BOLD)} #{color(store.password_for(key), YELLOW)}"
     end
 
     def cmd_logs(argv)
@@ -366,20 +363,15 @@ module DevEnv
     end
 
     def cmd_seed(argv)
-      options = {}
-      parser = parse_options!(argv, "Usage: dev-env seed [target] [--seed PATH]") do |o|
-        o.on("--seed PATH", "Dump to restore (default: project seed dump)") { |v| options[:seed] = v }
-      end
+      parser = parse_options!(argv, "Usage: dev-env seed [target]")
       key = resolve_target(argv, parser.banner)
       state = store.load(key)
       with_environment_lifecycle_lock(state["project_root"], state["project"], state["branch"]) do
         Caddy.new(@config).ensure_certificate_configuration!
         state = store.load(key)
-        template, dump = seeding(options)
-        raise Error, "seed dump not found: #{dump}" if dump && !File.exist?(dump)
-
         vars = project.vars_for(state)
         app_env = project.app_env_for(vars)
+        commands = interpolate(project.commands, vars)
 
         systemd.configure_process_manager(key, process_manager_for(state))
         stop_service!(key, command: "stop", message: "Stopping #{systemd.unit(key)} while the database is rebuilt")
@@ -390,13 +382,13 @@ module DevEnv
           db.drop(name)
           db.create(name)
         end
-        if template
-          clone_template(template, db, state["database"], state["worktree"], app_env, vars)
+        if (template = project.seed_template)
+          clone_template(template, db, state["database"], state["worktree"], vars)
         else
-          restore_dump(db, state["database"], dump, state["worktree"], app_env, vars)
+          project_command(commands["schema"], "Loading schema", state["worktree"], app_env)
         end
 
-        project_command(interpolate(project.commands, vars)["migrate"], "Running migrations", state["worktree"], app_env)
+        project_command(commands["migrate"], "Running migrations", state["worktree"], app_env)
 
         systemd.systemctl("start", systemd.unit(key))
         ok(wait_for_boot(state["port"]) ? "Reseeded #{key}" : "Reseeded #{key}, not answering yet")
@@ -414,7 +406,7 @@ module DevEnv
       states = project_states
       states.each do |state|
         caddy.write_site(state["key"], state["domain"], state["port"],
-                         state["basic_auth"] ? secrets.password_for(state["key"]) : nil)
+                         state["basic_auth"] ? store.password_for(state["key"]) : nil)
       end
       caddy.reload
 
@@ -529,8 +521,7 @@ module DevEnv
     end
 
     def project  = @project  ||= Project.load(@config)
-    def store    = @store    ||= Store.new(state_dir: @config.state_dir, run_dir: @config.run_dir)
-    def secrets  = @secrets  ||= Secrets.new(@config.secret_dir)
+    def store    = @store    ||= Store.new(state_dir: @config.state_dir, run_dir: @config.run_dir, secret_dir: @config.secret_dir)
     def caddy    = @caddy    ||= Caddy.new(@config, project: project)
     def teardown_caddy = @teardown_caddy ||= Caddy.new(@config)
     def worktrees = @worktrees ||= Worktrees.new(project)
@@ -540,7 +531,7 @@ module DevEnv
     def database_for(state)  = Database.for(state["database_settings"])
     def databases_for(state) = state["databases"]
 
-    # Project-defined teardown, mirroring after_restore. Runs after the service
+    # Project-defined teardown. Runs after the service
     # stops and before anything is removed, so hooks still see the worktree,
     # database and saved environment. dev-env only removes what it created; a
     # project whose server pairs extra resources with an environment (a second
@@ -686,7 +677,6 @@ module DevEnv
             rollback.reverse_each { |description, undo| try_cleanup(failures, description, &undo) } if stopped
             note "Service is still running; leaving its databases and worktree intact" unless stopped
             try_cleanup(failures, "remove systemd override") { systemd.configure_process_manager(key, nil) } if stopped
-            try_cleanup(failures, "remove password") { secrets.delete_password(key) } if failures.empty?
 
             if failures.empty?
               store.delete(key)
@@ -714,17 +704,8 @@ module DevEnv
 
       install_dependencies(commands["install"], worktree, app_env)
 
-      template, seed = seeding(options)
-      if seed && !File.exist?(seed)
-        raise Error, "seed dump not found: #{seed}" if options.key?(:seed)
-        note "No seed dump at #{seed} — starting with an empty database"
-        seed = nil
-      end
-
-      if template
-        clone_template(template, database_for(state), database, worktree, app_env, vars)
-      elsif seed
-        restore_dump(database_for(state), database, seed, worktree, app_env, vars)
+      if (template = options[:no_seed] ? nil : project.seed_template)
+        clone_template(template, database_for(state), database, worktree, vars)
       else
         project_command(commands["schema"], "Loading schema", worktree, app_env)
       end
@@ -733,7 +714,7 @@ module DevEnv
       # state["basic_auth"] is false when no hostname sits behind auth: a
       # password is pointless then, and claiming otherwise in the summary
       # would be worse than saying nothing.
-      password = state["basic_auth"] ? secrets.password_for(key) : nil
+      password = state["basic_auth"] ? store.password_for(key) : nil
 
       step "Writing configuration"
       store.write_env(key, app_env)
@@ -761,27 +742,7 @@ module DevEnv
       note "Not answering on 127.0.0.1:#{port} yet — check: dev-env logs #{branch} -f" unless wait_for_boot(port)
     end
 
-    # How this run seeds the database: a template to clone, or a dump to
-    # restore, or neither. A configured seed template replaces the dump, since
-    # cloning a database already on this server beats replaying a dump into a
-    # new one, but a --seed naming a dump or a --no-seed still decides for the
-    # one run.
-    def seeding(options)
-      return [nil, nil] if options[:no_seed]
-
-      template = project.seed_template unless options.key?(:seed)
-      return [template, nil] if template
-
-      [nil, options[:seed] || project.default_dump]
-    end
-
-    def restore_dump(db, database, dump, worktree, app_env, vars)
-      step "Restoring #{dump} into #{database}"
-      db.restore(database, dump)
-      run_after_restore(worktree, app_env, vars)
-    end
-
-    def clone_template(template, db, database, worktree, app_env, vars)
+    def clone_template(template, db, database, worktree, vars)
       # Derive the project environment again after pointing interpolation at
       # the template. This preserves configured DATABASE_URL options instead
       # of replacing them with the adapter's bare URL after interpolation.
@@ -793,12 +754,6 @@ module DevEnv
       template_env["DATABASE"] = template.database
       template_env["DATABASE_URL"] = template_vars["DATABASE_URL"] unless template_env.key?("DATABASE_URL")
       template.clone_into(db, database, worktree, template_env, template_vars)
-      run_after_restore(worktree, app_env, vars)
-    end
-
-    # However the database was seeded, the project gets the same hook after.
-    def run_after_restore(worktree, app_env, vars)
-      project.after_restore.each { |command| sh(interpolate(command, vars), chdir: worktree, env: app_env) }
     end
 
     # Steps of `up` and `seed` defined by the project; each is optional.
@@ -843,7 +798,7 @@ module DevEnv
         puts "  #{color(label.ljust(10), BOLD)} #{color(url, CYAN)}#{open}"
       end
       auth = if state["basic_auth"]
-               "#{@config.basic_auth_user} / #{color(secrets.password_for(key), YELLOW)}"
+               "#{@config.basic_auth_user} / #{color(store.password_for(key), YELLOW)}"
              else
                color("disabled", YELLOW)
              end

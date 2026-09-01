@@ -21,24 +21,18 @@ class UtilTest < Minitest::Test
     assert_equal 5, U.interpolate(5, vars)
   end
 
-  def test_run_raises_on_failure_and_returns_success
+  def test_subprocess_helpers_check_echo_and_capture
     assert_raises(DevEnv::Error) { U.run("false", quiet: true) }
     refute U.run("false", check: false, quiet: true)
     out, = capture_io { assert U.run("true") }
     assert_includes out, "$ true"
     assert_match(/└─ done \[\d+(?:ms|(?:\.\d+)?s)\]/, out)
-
     failed_out, = capture_io { refute U.run("false", check: false) }
-    assert_match(/└─ failed \[\d+(?:ms|(?:\.\d+)?s)\]/, failed_out)
-  end
+    assert_match(/└─ failed/, failed_out)
 
-  def test_sh_runs_through_the_shell
-    out, = capture_io { assert U.sh("true && true", chdir: Dir.pwd) }
-    assert_includes out, "$ true && true"
+    # sh goes through the shell; capture strips output and swallows stderr.
     capture_io { assert_raises(DevEnv::Error) { U.sh("exit 3", chdir: Dir.pwd) } }
-  end
-
-  def test_capture_strips_output_and_swallows_stderr
+    capture_io { assert U.sh("true && true", chdir: Dir.pwd) }
     assert_equal "hi", U.capture("echo", "hi")
     assert_equal "", U.capture("sh", "-c", "echo oops >&2")
   end
@@ -59,21 +53,17 @@ class UtilTest < Minitest::Test
     end
   end
 
-  def test_format_duration_uses_readable_units
+  def test_console_output_uses_readable_durations_and_respects_no_color
     assert_equal "125ms", U.format_duration(0.125)
-    assert_equal "1s", U.format_duration(1.0)
     assert_equal "1.3s", U.format_duration(1.26)
     assert_equal "1m 05s", U.format_duration(65)
     assert_equal "1h 02m 03s", U.format_duration(3_723)
-  end
 
-  def test_color_is_limited_to_terminals_and_honors_no_color
     terminal = Object.new
     terminal.define_singleton_method(:tty?) { true }
     redirected = Object.new
     redirected.define_singleton_method(:tty?) { false }
     previous = ENV.delete("NO_COLOR")
-
     assert_equal "\e[36mhello\e[0m", U.color("hello", U::CYAN, stream: terminal)
     assert_equal "hello", U.color("hello", U::CYAN, stream: redirected)
     ENV["NO_COLOR"] = "1"

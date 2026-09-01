@@ -1,8 +1,8 @@
 # frozen_string_literal: true
 
 module DevEnv
-  # Caddy site management: one machine-wide DNS-01 wildcard certificate, and
-  # the per-environment route files imported into it.
+  # One machine-wide DNS-01 wildcard certificate, and the per-environment
+  # route files imported into it.
   class Caddy
     include Util
 

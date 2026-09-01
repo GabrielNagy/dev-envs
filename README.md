@@ -52,8 +52,8 @@ are serialized briefly without holding up the rest of each operation.
 
 ## Setting up a machine
 
-Needs postgres, Caddy, and one `*.<base domain>` wildcard DNS record pointing at
-the box.
+Needs a database server (postgres, MySQL or MariaDB), Caddy, and one
+`*.<base domain>` wildcard DNS record pointing at the box.
 
 ```sh
 dev-env setup     # writes ~/.config/dev-envs/config.json, then re-run to write the Caddy config
@@ -146,14 +146,11 @@ Keys, all optional except `commands.server`:
 | `process_manager` | Set to `overmind` when `commands.server` delegates to Overmind |
 | `database` | Engine and connection: `adapter`, `host`, `port`, `user`, `extra` |
 | `env` | Environment variables for those commands and the service |
-| `after_restore` | Commands to run after the database is seeded |
 | `after_down` | Commands run by `down` after the service stops, before anything is removed |
 | `summary` | Labelled commands whose output becomes a row of the `up` summary |
-| `link_from_root` | Globs symlinked from the primary checkout into each worktree, for gitignored files such as credential keys |
-| `worktree_files` | Untracked files written into each worktree, optionally guarded by `unless_file_contains` |
+| `worktree_files` | Untracked files written into each worktree |
 | `install_cache` | Seed an install directory from the last successful install with matching key files |
-| `seed_template` | Seed each environment by cloning a template database instead of restoring a dump |
-| `seed`, `worktree_root` | Override the defaults |
+| `seed_template` | Seed each environment by cloning a template database |
 
 `${DOMAIN}`, `${DOMAIN_RE}`, `${PORT}`, `${DATABASE}`, `${DATABASE_URL}`,
 `${BRANCH}`, `${PROJECT}`, `${WORKTREE}` and `${TLD_LENGTH}` are interpolated, as
@@ -274,7 +271,7 @@ dropped on `down`. A project on MariaDB or MySQL declares it:
 ```
 
 `adapter` is `postgres` (the default) or `mysql` (alias `mariadb`). The adapter
-decides how databases are created, dropped and restored, and what the default
+decides how databases are created, dropped and cloned, and what the default
 `${DATABASE_URL}` looks like — `postgresql:///…` or `mysql2://…`; a project
 wanting other query options overrides `DATABASE_URL` in `env`. The MySQL client
 connects over TCP to `host` (default `127.0.0.1`) and `port` (default `3306`)
@@ -284,7 +281,7 @@ as `user` when given, so create/drop reach the same server the URL names.
 commands — `${DATABASE}` is the primary's name. They are created by `up`,
 recreated by `seed` and dropped by `down` together with the primary, so a
 project needing a second database does not have to create it in `install` and
-clean it up by hand. Seed dumps restore into the primary only.
+clean it up by hand.
 
 The adapter and the database list are recorded in the environment's state at
 `up`, so `down` works outside the repository and is unaffected by later
@@ -292,16 +289,9 @@ project configuration edits.
 
 ## Seed data
 
-`dev-env up` restores `~/.config/dev-envs/dumps/<project>-seed.pdump` if present, and
-starts from a bare schema otherwise. `dev-env seed <branch>` rebuilds an
-existing environment's database from it. On MySQL the default dump is
-`<project>-seed.sql` — plain SQL, as `mysqldump` writes it.
-
-### Seed templates
-
-Restoring a dump costs the same minutes in every environment, and a dump
-published once a day is the same dump every time. A project can instead keep one
-seeded database on the server and have `up` clone it:
+Without a seed template, `up` starts each environment from a bare schema
+through `commands.schema`. A project can instead keep one seeded database on
+the server and have `up` clone it:
 
 ```json
 "seed_template": {
@@ -342,8 +332,8 @@ template that took around 10 seconds where the dump took 75. Views are copied
 as definitions rather than inserted into, and triggers are installed once the
 rows are in, so a trigger does not fire for every row the clone copies.
 
-A configured template replaces the dump. `up --seed PATH` restores that dump
-instead for one run, and `up --no-seed` skips seeding altogether.
+`dev-env seed <target>` rebuilds an existing environment's databases the same
+way, and `up --no-seed` skips the template and loads `commands.schema` instead.
 
 ## Certificates and capacity
 

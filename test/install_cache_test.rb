@@ -11,17 +11,16 @@ class InstallCacheTest < Minitest::Test
     @worktree = Dir.mktmpdir.tap { |dir| @tmp_dirs << dir }
     @spec = {
       "directory" => "node_modules",
-      "key_files" => ["package.json", "packages/*/package.json", "yarn.lock", ".yarnrc"],
+      "key_files" => ["package.json", "packages/*/package.json", "yarn.lock"],
     }
     FileUtils.mkdir_p(File.join(@worktree, "packages", "app"))
     File.write(File.join(@worktree, "package.json"), "{\"private\":true}\n")
     File.write(File.join(@worktree, "packages", "app", "package.json"), "{\"name\":\"app\"}\n")
     File.write(File.join(@worktree, "yarn.lock"), "# yarn lockfile v1\n")
-    File.write(File.join(@worktree, ".yarnrc"), "ignore-scripts true\n")
   end
 
-  def cache(command: "yarn install")
-    DevEnv::InstallCache.new(cache_dir: @cache_dir, project_root: @project_root,
+  def cache(command: "yarn install", cache_dir: @cache_dir)
+    DevEnv::InstallCache.new(cache_dir: cache_dir, project_root: @project_root,
                              worktree: @worktree, command: command, spec: @spec)
   end
 
@@ -44,16 +43,22 @@ class InstallCacheTest < Minitest::Test
     result
   end
 
-  def test_store_and_restore_use_an_independent_copy
-    installed = write_module("installed\n")
+  def test_roundtrip_uses_an_independent_copy_and_a_new_store_replaces_the_snapshot
+    installed = write_module("first\n")
     assert store
     cached = Dir.glob(File.join(@cache_dir, "**", "directory", "example", "index.js")).fetch(0)
     FileUtils.rm_rf(File.join(@worktree, "node_modules"))
 
     assert restore
-
-    assert_equal "installed\n", File.read(installed)
+    assert_equal "first\n", File.read(installed)
     refute_equal File.stat(cached).ino, File.stat(installed).ino
+
+    File.write(File.join(@worktree, "yarn.lock"), "# yarn lockfile v1\nchanged\n")
+    write_module("second\n")
+    assert store
+    FileUtils.rm_rf(File.join(@worktree, "node_modules"))
+    assert restore
+    assert_equal "second\n", File.read(installed)
   end
 
   def test_restore_requires_the_same_key_files_and_install_command
@@ -70,27 +75,12 @@ class InstallCacheTest < Minitest::Test
     refute_path_exists File.join(@worktree, "node_modules")
   end
 
-  def test_store_replaces_the_previous_snapshot
-    write_module("first\n")
-    store
-
-    File.write(File.join(@worktree, "yarn.lock"), "# yarn lockfile v1\nchanged\n")
-    write_module("second\n")
-    assert store
-    FileUtils.rm_rf(File.join(@worktree, "node_modules"))
-
-    assert restore
-    assert_equal "second\n", File.read(File.join(@worktree, "node_modules", "example", "index.js"))
-  end
-
   def test_a_cache_write_failure_does_not_fail_the_install
     write_module("installed\n")
     unusable_cache_dir = File.join(@cache_dir, "not-a-directory")
     File.write(unusable_cache_dir, "file\n")
-    current = DevEnv::InstallCache.new(cache_dir: unusable_cache_dir, project_root: @project_root,
-                                       worktree: @worktree, command: "yarn install", spec: @spec)
 
-    _, err = capture_io { refute current.store }
+    _, err = capture_io { refute cache(cache_dir: unusable_cache_dir).store }
 
     assert_includes err, "continuing without updating the install cache"
   end

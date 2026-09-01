@@ -1,7 +1,6 @@
 # frozen_string_literal: true
 
 module DevEnv
-  # The systemd user unit template and per-unit control.
   class Systemd
     include Util
 

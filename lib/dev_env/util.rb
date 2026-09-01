@@ -1,8 +1,6 @@
 # frozen_string_literal: true
 
 module DevEnv
-  # Console output, subprocess execution and small pure helpers shared by
-  # every class.
   module Util
     module_function
 
@@ -65,18 +63,17 @@ module DevEnv
       success
     end
 
-    # Project-supplied commands are arbitrary shell: a single String makes
-    # system() invoke the shell rather than exec an argv.
+    # A single String makes system() invoke the shell, which project-supplied
+    # commands rely on.
     def sh(command, chdir:, env: {}, check: true) = run(command, chdir: chdir, env: env, check: check)
 
     def capture(*cmd)
       IO.popen(cmd, err: File::NULL, &:read).to_s.strip
     end
 
-    # capture for a command whose failure must not pass as an answer. capture
-    # swallows the exit status, which suits a query whose empty output is
-    # itself a result and not a query whose empty output would be mistaken
-    # for one. Statements too long for a command line go in through stdin.
+    # capture swallows the exit status; this raises instead, for queries whose
+    # empty output would otherwise be mistaken for an answer. Statements too
+    # long for a command line go in through stdin.
     def capture!(*cmd, stdin: nil)
       out, err, status = Open3.capture3(*cmd, stdin_data: stdin.to_s)
       raise Error, "command failed: #{cmd.join(' ')}\n#{err.strip}" unless status.success?
@@ -84,17 +81,16 @@ module DevEnv
       out
     end
 
-    # capture for a project-supplied shell string, run in an environment's
-    # worktree with its variables. A command that fails is indistinguishable
-    # from one that prints nothing: callers use this where neither aborts.
+    # A command that fails is indistinguishable from one that prints nothing:
+    # callers use this where neither aborts.
     def capture_sh(command, chdir:, env: {})
       IO.popen(env, command, err: File::NULL, chdir: chdir, &:read).to_s.strip
     rescue SystemCallError
       ""
     end
 
-    # Replace a generated file only after its complete contents are durable.
-    # The temporary file lives beside the destination, so rename is atomic.
+    # The temporary file lives beside the destination, so rename is atomic and
+    # a reader never sees partial contents.
     def atomic_write(path, content, mode: nil)
       directory = File.dirname(path)
       FileUtils.mkdir_p(directory)

@@ -14,7 +14,7 @@ class CaddyTest < Minitest::Test
     DevEnv::Caddy.new(@config, project: project)
   end
 
-  def test_sites_use_matchers_and_split_guarded_and_open_hosts
+  def test_sites_split_guarded_and_open_hosts_and_auth_is_the_only_difference
     caddy = build_caddy
     caddy.define_singleton_method(:hash_password) { |_| "HASH" } # avoid needing the caddy binary
     caddy.write_site(KEY, "epxrnilj-proj.example.com", 4001, "pw")
@@ -24,19 +24,15 @@ class CaddyTest < Minitest::Test
     assert_includes site, "basic_auth {\n\t\tdev HASH"
     assert_includes site, "@proj__feature__epxrnilj_open host mcp-epxrnilj-proj.example.com"
     refute_includes site.split("_open").last, "basic_auth"
-  end
-
-  def test_without_password_everything_is_open_on_the_same_hosts
-    caddy = build_caddy
-    caddy.define_singleton_method(:hash_password) { |_| "HASH" }
-    caddy.write_site(KEY, "epxrnilj-proj.example.com", 4001, "pw")
-    guarded_hosts = File.read(caddy.site_path(KEY)).scan(/host ([^\n]+)/).flatten.flat_map(&:split).sort
+    guarded_hosts = site.scan(/host ([^\n]+)/).flatten.flat_map(&:split).sort
 
     caddy.write_site(KEY, "epxrnilj-proj.example.com", 4001, nil)
-    site = File.read(caddy.site_path(KEY))
-    refute_includes site, "basic_auth"
-    # Auth is the only difference: the hostnames do not depend on it.
-    assert_equal guarded_hosts, site.scan(/host ([^\n]+)/).flatten.flat_map(&:split).sort
+    open_site = File.read(caddy.site_path(KEY))
+    refute_includes open_site, "basic_auth"
+    assert_equal guarded_hosts, open_site.scan(/host ([^\n]+)/).flatten.flat_map(&:split).sort
+
+    caddy.delete_site(KEY)
+    refute_path_exists caddy.site_path(KEY)
   end
 
   def test_wildcard_site_covers_bare_and_folded_subdomain_hosts
@@ -58,16 +54,9 @@ class CaddyTest < Minitest::Test
     end
   end
 
-  def test_delete_site_removes_the_route_file
+  def test_base_domain_change_is_refused_but_unmanaged_sites_are_left_alone
     caddy = build_caddy
-    caddy.write_site(KEY, "epxrnilj-proj.example.com", 4001, nil)
-    assert_path_exists caddy.site_path(KEY)
-    caddy.delete_site(KEY)
-    refute_path_exists caddy.site_path(KEY)
-  end
-
-  def test_base_domain_change_is_refused
-    caddy = build_caddy
+    File.write(File.join(@config.sites_dir, "manual.wildcard.caddy"), "example.com {\n}\n")
     caddy.ensure_wildcard_site
     caddy.ensure_certificate_configuration! # same base_domain: fine
 
@@ -79,11 +68,5 @@ class CaddyTest < Minitest::Test
     error = assert_raises(DevEnv::Error) { changed.ensure_certificate_configuration! }
     assert_includes error.message, "dev-env down --all"
     assert_includes error.message, "dev-env setup"
-  end
-
-  def test_unmanaged_sites_are_left_alone
-    caddy = build_caddy
-    File.write(File.join(@config.sites_dir, "manual.wildcard.caddy"), "example.com {\n}\n")
-    caddy.ensure_certificate_configuration!
   end
 end

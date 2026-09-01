@@ -13,7 +13,6 @@ class WorktreesTest < Minitest::Test
            "commit", "-q", "--allow-empty", "-m", "init")
     @project = build_project(@config,
                              { "name" => "proj",
-                               "link_from_root" => [".env.key"],
                                "worktree_files" => {
                                  "config/local.rb" => ["domain '${DOMAIN}'", "database '${DATABASE}'"],
                                } },
@@ -21,10 +20,6 @@ class WorktreesTest < Minitest::Test
     @worktrees = DevEnv::Worktrees.new(@project)
     @path = File.join(Dir.mktmpdir.tap { @tmp_dirs << _1 }, "wt-feature")
   end
-
-  # write_files interpolates the variables `up` builds for every consumer, not
-  # the domain alone.
-  def vars = { "DOMAIN" => "pkliinp6-proj.example.com", "DATABASE" => "dev_env_proj_41000_pkliinp6" }
 
   def create_worktree(branch = "feature", base = "main")
     capture_subprocess_io { @worktrees.create(@path, branch, base) }
@@ -46,37 +41,27 @@ class WorktreesTest < Minitest::Test
     refute Dir.exist?(@path)
   end
 
-  def test_dirty_detects_uncommitted_changes
+  def test_dirty_detects_uncommitted_changes_and_reports_inspection_failures
     create_worktree
     refute DevEnv::Worktrees.dirty?(@path)
 
     File.write(File.join(@path, "uncommitted.txt"), "keep me")
     assert DevEnv::Worktrees.dirty?(@path)
-  end
 
-  def test_dirty_reports_git_inspection_failures
     directory = Dir.mktmpdir.tap { |dir| @tmp_dirs << dir }
-
     error = assert_raises(DevEnv::Error) { DevEnv::Worktrees.dirty?(directory) }
-
     assert_includes error.message, "could not inspect worktree #{directory}"
     assert_includes error.message, "not a git repository"
   end
 
-  def test_write_files_links_writes_and_excludes
-    File.write(File.join(@repo, ".env.key"), "sekret")
+  def test_write_files_interpolates_and_excludes_from_git
     create_worktree
 
-    capture_io { @worktrees.write_files(@path, vars) }
+    capture_io { @worktrees.write_files(@path, "DOMAIN" => "pkliinp6-proj.example.com",
+                                               "DATABASE" => "dev_env_proj_41000_pkliinp6") }
 
-    assert_equal File.join(@repo, ".env.key"), File.readlink(File.join(@path, ".env.key"))
     assert_equal "domain 'pkliinp6-proj.example.com'\ndatabase 'dev_env_proj_41000_pkliinp6'\n",
                  File.read(File.join(@path, "config/local.rb"))
     assert_includes File.read(File.join(@repo, ".git", "info", "exclude")), "config/local.rb"
-
-    # Writing into the primary checkout itself must not clobber the real file.
-    capture_io { @worktrees.write_files(@repo, vars) }
-    refute File.symlink?(File.join(@repo, ".env.key"))
-    assert_equal "sekret", File.read(File.join(@repo, ".env.key"))
   end
 end

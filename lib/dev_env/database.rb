@@ -3,8 +3,8 @@
 module DevEnv
   # The database engine behind each environment: postgres unless project
   # configuration declares {"database": {"adapter": "mysql"}}. The adapter
-  # owns everything engine-specific — existence checks, create/drop, dump
-  # restore and the default DATABASE_URL — so nothing else needs to branch on
+  # owns everything engine-specific — existence checks, create/drop, template
+  # cloning and the default DATABASE_URL — so nothing else needs to branch on
   # the engine.
   class Database
     include Util
@@ -24,19 +24,14 @@ module DevEnv
       @settings = settings
     end
 
-    # Databases beyond the primary — {"extra": ["${DATABASE}_data_science"]} —
-    # created on `up` and dropped on `down` alongside it, so a project needing
-    # more than one database does not have to create and clean them up itself.
+    # Databases beyond the primary, created on `up` and dropped on `down`
+    # alongside it.
     def extra_names(vars) = interpolate(Array(@settings["extra"]), vars)
 
     class Postgres < Database
-      def dump_extension = ".pdump"
-
       def exists?(name) = capture("psql", "-tAc", "SELECT 1 FROM pg_database WHERE datname = '#{name}'") == "1"
       def create(name)  = run("createdb", name)
       def drop(name, quiet: false) = run("dropdb", "--if-exists", name, quiet: quiet)
-
-      def restore(name, dump) = run("pg_restore", "--no-owner", "--no-acl", "-d", name, dump)
 
       # Postgres copies a database for us: CREATE DATABASE ... TEMPLATE
       # duplicates the source's files. It refuses while another session holds
@@ -69,8 +64,6 @@ module DevEnv
       # which the server applies serially however the rows are divided.
       CLONE_JOBS = 8
 
-      def dump_extension = ".sql"
-
       # information_schema equality rather than SHOW DATABASES LIKE, whose
       # pattern would treat the underscores in every generated name as
       # wildcards.
@@ -82,18 +75,11 @@ module DevEnv
       def create(name) = run("mysql", *client_args, "-e", "CREATE DATABASE `#{name}`")
       def drop(name, quiet: false) = run("mysql", *client_args, "-e", "DROP DATABASE IF EXISTS `#{name}`", quiet: quiet)
 
-      # A MySQL seed dump is plain SQL, as mysqldump writes it.
-      def restore(name, dump)
-        run("sh", "-c", "mysql #{Shellwords.join(client_args)} #{name} < #{Shellwords.escape(dump)}")
-      end
-
-      # Recreate a seeded template as a new database on the same server. The
-      # rows never leave the server, so this skips the serialize-and-parse
-      # round trip that restoring a dump into every new environment pays:
-      # against a 1.5GB template it takes around 10 seconds where the dump
-      # takes 75. MariaDB offers nothing cheaper. It has no CREATE DATABASE
-      # ... LIKE, and importing the template's tablespaces instead needs root
-      # access to the data directory and loses AUTO_INCREMENT on the way in.
+      # Recreate a seeded template as a new database on the same server through
+      # INSERT ... SELECT: the rows never leave the server, so this skips the
+      # serialize-and-parse round trip a dump pays (~10s vs ~75s against a 1.5GB
+      # template). MariaDB offers nothing cheaper — no CREATE DATABASE ... LIKE,
+      # and importing tablespaces needs root and loses AUTO_INCREMENT.
       def clone_from(template, name, jobs: CLONE_JOBS)
         columns = insertable_columns(template)
         if columns.empty?
@@ -109,9 +95,8 @@ module DevEnv
         feed(triggers_of(template), database: name)
       end
 
-      # mysql2:// is what Rails expects, which the defaults elsewhere also
-      # happen to suit; a project wanting another scheme or query options
-      # overrides DATABASE_URL in its env.
+      # mysql2:// is what Rails expects; a project wanting another scheme or
+      # query options overrides DATABASE_URL in its env.
       def url(name) = "mysql2://#{user ? "#{user}@" : ''}#{host}:#{port}/#{name}"
 
       # Credentials do not distinguish a physical database: two projects

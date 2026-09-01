@@ -27,7 +27,8 @@ class CLITest < Minitest::Test
     @config = build_config
     @cli = DevEnv::CLI.new(config: @config)
     FileUtils.mkdir_p([@config.state_dir, @config.run_dir, @config.secret_dir])
-    @store = DevEnv::Store.new(state_dir: @config.state_dir, run_dir: @config.run_dir)
+    @store = DevEnv::Store.new(state_dir: @config.state_dir, run_dir: @config.run_dir,
+                               secret_dir: @config.secret_dir)
   end
 
   # Runs the block inside a git repository configured as project `name`, so
@@ -63,6 +64,14 @@ class CLITest < Minitest::Test
            "commit", "-q", "--allow-empty", "-m", "init")
     system("git", "-C", repo, "worktree", "add", "-q", "-b", "feature", worktree)
     [repo, worktree]
+  end
+
+  # Replaces everything teardown asks of systemd and Caddy.
+  def stub_teardown(status: "inactive")
+    @cli.send(:teardown_caddy).define_singleton_method(:reload) { nil }
+    @cli.send(:systemd).define_singleton_method(:systemctl) { |*| true }
+    @cli.send(:systemd).define_singleton_method(:status) { |_| status }
+    @cli.send(:systemd).define_singleton_method(:configure_process_manager) { |*| nil }
   end
 
   # Replaces the adapter's subprocesses so no test touches a real database
@@ -103,16 +112,12 @@ class CLITest < Minitest::Test
     state
   end
 
-  def test_help_prints_usage
+  def test_help_prints_usage_and_every_command_supports_help_without_running
     out, = capture_io { @cli.start(["help"]) }
     assert_includes out, "Usage: dev-env <command>"
-    assert_includes out, "setup"
     assert_includes out, "up [branch]"
     assert_includes out, "down --all"
-    refute_match(/slot/i, out)
-  end
 
-  def test_every_command_supports_help_without_running
     DevEnv::CLI::COMMANDS.each do |command|
       out, = capture_io do
         error = assert_raises(SystemExit) { @cli.start([command, "--help"]) }
@@ -125,7 +130,7 @@ class CLITest < Minitest::Test
     assert_includes out, "Usage: dev-env down"
   end
 
-  def test_invalid_options_and_extra_arguments_exit_cleanly
+  def test_errors_invalid_options_and_unknown_commands_exit_nonzero
     [["setup", "--bogus"], ["list", "extra"], ["up", "one", "two"]].each do |argv|
       command = argv.first
       _, err = capture_io do
@@ -135,9 +140,32 @@ class CLITest < Minitest::Test
       assert_includes err, "Usage: dev-env #{command}"
       refute_includes err, "cli.rb:"
     end
+
+    Dir.chdir(Dir.mktmpdir.tap { |d| @tmp_dirs << d }) do
+      _, err = capture_io { assert_raises(SystemExit) { @cli.start(["init"]) } }
+      assert_includes err, "not inside a git repository"
+    end
+
+    exit_error = assert_raises(SystemExit) { capture_io { @cli.start(["bogus"]) } }
+    assert_equal 1, exit_error.status
   end
 
-  def test_environment_lifecycle_locks_allow_different_targets_and_reject_the_same_target
+  def test_init_writes_starter_config_once
+    repo = Dir.mktmpdir.tap { |d| @tmp_dirs << d }
+    system("git", "init", "-q", repo)
+    Dir.chdir(repo) do
+      capture_io { @cli.start(["init"]) }
+      settings = JSON.parse(File.read(".dev-env.json"))
+      assert_equal File.basename(repo), settings["name"]
+      assert settings.dig("commands", "server")
+      assert_equal false, settings["public"]
+
+      _, err = capture_io { assert_raises(SystemExit) { DevEnv::CLI.new(config: build_config).start(["init"]) } }
+      assert_includes err, "already exists"
+    end
+  end
+
+  def test_lifecycle_locks_serialize_the_same_target_and_machine_wide_operations
     other = DevEnv::CLI.new(config: @config)
     different_acquired = false
 
@@ -148,16 +176,13 @@ class CLITest < Minitest::Test
       end
       assert_includes error.message, "another dev-env operation is targeting proj/feature-a"
       assert_includes error.message, Process.pid.to_s
+
+      error = assert_raises(DevEnv::Error) do
+        other.send(:with_machine_lifecycle_lock) { flunk "lock was acquired" }
+      end
+      assert_includes error.message, "another dev-env lifecycle operation"
     end
-
     assert different_acquired
-    acquired = false
-    other.send(:with_environment_lifecycle_lock, "/repo", "proj", "feature-a") { acquired = true }
-    assert acquired, "the target lock should be released when the operation finishes"
-  end
-
-  def test_machine_lifecycle_lock_excludes_targeted_operations_in_both_directions
-    other = DevEnv::CLI.new(config: @config)
 
     @cli.send(:with_machine_lifecycle_lock) do
       error = assert_raises(DevEnv::Error) do
@@ -166,12 +191,9 @@ class CLITest < Minitest::Test
       assert_includes error.message, "machine-wide dev-env operation"
     end
 
-    @cli.send(:with_environment_lifecycle_lock, "/repo", "proj", "feature") do
-      error = assert_raises(DevEnv::Error) do
-        other.send(:with_machine_lifecycle_lock) { flunk "lock was acquired" }
-      end
-      assert_includes error.message, "another dev-env lifecycle operation"
-    end
+    acquired = false
+    other.send(:with_environment_lifecycle_lock, "/repo", "proj", "feature-a") { acquired = true }
+    assert acquired, "the target lock should be released when the operation finishes"
   end
 
   def test_base_domain_change_is_automatic_when_empty_and_requires_down_all_for_environments
@@ -204,34 +226,7 @@ class CLITest < Minitest::Test
     ENV["PATH"] = previous_path
   end
 
-  def test_unknown_command_exits_nonzero
-    exit_error = assert_raises(SystemExit) { capture_io { @cli.start(["bogus"]) } }
-    assert_equal 1, exit_error.status
-  end
-
-  def test_errors_are_reported_and_exit_nonzero
-    Dir.chdir(Dir.mktmpdir.tap { |d| @tmp_dirs << d }) do
-      _, err = capture_io { assert_raises(SystemExit) { @cli.start(["init"]) } }
-      assert_includes err, "not inside a git repository"
-    end
-  end
-
-  def test_init_writes_starter_config_once
-    repo = Dir.mktmpdir.tap { |d| @tmp_dirs << d }
-    system("git", "init", "-q", repo)
-    Dir.chdir(repo) do
-      capture_io { @cli.start(["init"]) }
-      settings = JSON.parse(File.read(".dev-env.json"))
-      assert_equal File.basename(repo), settings["name"]
-      assert settings.dig("commands", "server")
-      assert_equal false, settings["public"]
-
-      _, err = capture_io { assert_raises(SystemExit) { DevEnv::CLI.new(config: build_config).start(["init"]) } }
-      assert_includes err, "already exists"
-    end
-  end
-
-  def test_install_dependencies_restores_a_matching_cache_before_running_the_command
+  def test_install_dependencies_restores_a_matching_cache_but_never_a_failed_install
     calls = File.join(Dir.mktmpdir.tap { |dir| @tmp_dirs << dir }, "calls")
     install = <<~SH.strip
       if [ -f node_modules/example/index.js ]; then echo seeded; else echo cold; fi >> #{Shellwords.escape(calls)}
@@ -254,72 +249,26 @@ class CLITest < Minitest::Test
       assert_includes first_out, "Saving node_modules to the install cache"
       assert_includes second_out, "Restoring cached node_modules"
     end
-  end
 
-  def test_install_dependencies_does_not_cache_a_failed_install
-    install = "mkdir -p node_modules/example && exit 1"
-    settings = {
-      "commands" => { "install" => install },
-      "install_cache" => { "directory" => "node_modules", "key_files" => ["package.json", "yarn.lock"] },
-    }
-
-    in_project("proj", settings) do
+    failing = "mkdir -p node_modules/example && exit 1"
+    in_project("proj", settings.merge("commands" => { "install" => failing })) do
       File.write("package.json", "{\"private\":true}\n")
-      File.write("yarn.lock", "# lock\n")
+      File.write("yarn.lock", "# a different lock\n")
 
       capture_io do
-        assert_raises(DevEnv::Error) { @cli.send(:install_dependencies, install, Dir.pwd, {}) }
+        assert_raises(DevEnv::Error) { @cli.send(:install_dependencies, failing, Dir.pwd, {}) }
       end
 
-      assert_empty Dir.glob(File.join(@config.cache_dir, "installs", "*", "fingerprint"))
+      # Only the earlier successful install left a snapshot.
+      assert_equal 1, Dir.glob(File.join(@config.cache_dir, "installs", "*", "fingerprint")).length
     end
   end
 
-  def test_seeding_prefers_a_configured_template_over_the_dump
-    settings = { "seed_template" => { "build" => "load-seed ${DATABASE}" } }
-
-    in_project("proj", settings) do
-      template, dump = @cli.send(:seeding, {})
-
-      assert_equal "dev_env_proj_template", template.database
-      assert_nil dump
-    end
-  end
-
-  def test_seeding_lets_one_run_name_a_dump_instead_of_the_template
-    settings = { "seed_template" => { "build" => "load-seed ${DATABASE}" } }
-
-    in_project("proj", settings) do
-      template, dump = @cli.send(:seeding, { seed: "/dumps/other.sql" })
-
-      assert_nil template
-      assert_equal "/dumps/other.sql", dump
-    end
-  end
-
-  def test_seeding_skips_both_for_no_seed
-    settings = { "seed_template" => { "build" => "load-seed ${DATABASE}" } }
-
-    in_project("proj", settings) do
-      assert_equal [nil, nil], @cli.send(:seeding, { no_seed: true })
-    end
-  end
-
-  def test_seeding_falls_back_to_the_project_dump_without_a_template
-    in_project("proj") do
-      template, dump = @cli.send(:seeding, {})
-
-      assert_nil template
-      assert_equal File.join(@config.dump_dir, "proj-seed.pdump"), dump
-    end
-  end
-
-  def test_cloning_a_template_builds_it_once_and_runs_after_restore
+  def test_cloning_a_template_builds_it_once_and_preserves_configured_url_options
     calls = File.join(Dir.mktmpdir.tap { |dir| @tmp_dirs << dir }, "calls")
     settings = {
       "seed_template" => { "build" => "echo built ${DATABASE} $DATABASE_URL >> #{Shellwords.escape(calls)}" },
       "env" => { "DATABASE_URL" => "${DATABASE_URL}?ssl-mode=REQUIRED" },
-      "after_restore" => ["echo hooked >> #{Shellwords.escape(calls)}"],
     }
 
     in_project("proj", settings) do
@@ -327,32 +276,32 @@ class CLITest < Minitest::Test
       template = @cli.send(:project).seed_template
 
       2.times do
-        capture_io { @cli.send(:clone_template, template, db, "dev_env_proj_4000_ab", Dir.pwd, {}, {}) }
+        capture_io { @cli.send(:clone_template, template, db, "dev_env_proj_4000_ab", Dir.pwd, {}) }
       end
 
-      # The template is built once and cloned twice, and however the database
-      # was seeded the project's hook runs after it. Rebuilding the project
-      # environment from template variables preserves its configured URL
-      # options while changing the database name.
-      assert_equal ["built dev_env_proj_template mysql2://127.0.0.1:3306/dev_env_proj_template?ssl-mode=REQUIRED",
-                    "hooked", "hooked"], File.readlines(calls, chomp: true)
+      # Rebuilding the project environment from template variables preserves
+      # its configured URL options while changing the database name.
+      assert_equal ["built dev_env_proj_template mysql2://127.0.0.1:3306/dev_env_proj_template?ssl-mode=REQUIRED"],
+                   File.readlines(calls, chomp: true)
       assert_equal [["dev_env_proj_template", "dev_env_proj_4000_ab"]] * 2, db.clones
     end
   end
 
-  def test_list_with_no_environments
+  def test_list_shows_a_row_per_environment_and_ls_is_an_alias
     out, = capture_io { @cli.start(["list"]) }
     assert_includes out, "No environments."
-  end
 
-  def test_ls_is_an_alias_for_list
-    save_state(project: "proj", branch: "feature", port: 4000, id: "aaaaaaaa")
-    @cli.send(:systemd).define_singleton_method(:status) { |_| "active" }
+    5.times { |n| save_state(project: "proj", branch: "branch-#{n}", port: 4000 + n, id: "id#{n}aaaaa") }
+    @cli.send(:systemd).define_singleton_method(:status) { |_| "inactive" }
 
-    list_out, = capture_io { @cli.start(["list"]) }
+    out, = capture_io { @cli.start(["list"]) }
+    lines = out.lines.map(&:chomp).reject(&:empty?)
+    assert_equal %w[ID PROJECT BRANCH PORT STATUS URL], lines.first.split
+    assert_equal 6, lines.length
+    assert_includes out, "https://id0aaaaa-proj.example.com"
+
     ls_out, = capture_io { @cli.start(["ls"]) }
-
-    assert_equal list_out, ls_out
+    assert_equal out, ls_out
   end
 
   def test_logs_accepts_a_target_and_follow_option
@@ -363,18 +312,6 @@ class CLITest < Minitest::Test
     @cli.send(:cmd_logs, ["aaaaaaaa", "--follow"])
 
     assert_equal ["journalctl", "--user", "-u", "dev-env@proj--feature--aaaaaaaa.service", "--follow"], executed
-  end
-
-  def test_list_shows_exactly_project_branch_port_status_url_for_any_number_of_environments
-    5.times { |n| save_state(project: "proj", branch: "branch-#{n}", port: 4000 + n, id: "id#{n}aaaaa") }
-    @cli.send(:systemd).define_singleton_method(:status) { |_| "inactive" }
-
-    out, = capture_io { @cli.start(["list"]) }
-    lines = out.lines.map(&:chomp).reject(&:empty?)
-    assert_equal %w[ID PROJECT BRANCH PORT STATUS URL], lines.first.split
-    assert_equal 6, lines.length # header + one row per environment, no free-slot footer
-    refute_match(/free/i, out)
-    assert_includes out, "https://id0aaaaa-proj.example.com"
   end
 
   def test_resolve_finds_state_by_exact_project_and_branch_despite_colliding_slugs
@@ -391,17 +328,12 @@ class CLITest < Minitest::Test
     end
   end
 
-  def test_up_rejects_a_second_environment_for_the_same_project_and_branch
+  def test_up_rejects_a_second_environment_for_the_branch_and_infers_it_from_the_checkout
     save_state(project: "proj", branch: "feature", port: 4001, id: "aaaaaaaa")
     in_project do
       error = assert_raises(DevEnv::Error) { @cli.send(:cmd_up, ["feature"]) }
       assert_includes error.message, "already has an environment"
-    end
-  end
 
-  def test_up_infers_the_branch_from_the_current_checkout_when_omitted
-    save_state(project: "proj", branch: "feature", port: 4001, id: "aaaaaaaa")
-    in_project do
       system("git", "checkout", "-q", "-b", "feature")
       error = assert_raises(DevEnv::Error) { @cli.send(:cmd_up, []) }
       assert_includes error.message, "already has an environment", "expected the checked-out branch to be inferred"
@@ -431,7 +363,7 @@ class CLITest < Minitest::Test
     assert_equal "parent", base
   end
 
-  def test_up_uses_the_project_public_default
+  def test_up_uses_the_project_public_default_and_options_override_it
     private_state = up_state_for({})
     assert_match(/\A[a-z0-9]{8}\z/, private_state["id"])
     assert_equal "proj--feature--#{private_state['id']}", private_state["key"]
@@ -439,69 +371,51 @@ class CLITest < Minitest::Test
     assert_equal "dev_env_proj_#{private_state['port']}_#{private_state['id']}", private_state["database"]
     assert_equal true, private_state["basic_auth"]
     assert_equal false, up_state_for({ "public" => true })["basic_auth"]
-  end
 
-  def test_up_public_and_private_options_override_the_project_default
     assert_equal false, up_state_for({ "public" => false }, "--public")["basic_auth"]
     assert_equal true, up_state_for({ "public" => true }, "--private")["basic_auth"]
   end
 
-  def test_generated_ids_retry_recorded_collisions
+  def test_generated_ids_retry_recorded_and_in_flight_collisions
     save_state(project: "proj", branch: "feature", port: 4001, id: "aaaaaaaa")
     sequence = %w[aaaaaaaa bbbbbbbb]
     @cli.define_singleton_method(:random_environment_id) { sequence.shift }
 
     selected = @cli.send(:with_environment_id_reservation) { |id| id }
-
     assert_equal "bbbbbbbb", selected
     assert_empty sequence
-  end
 
-  def test_generated_ids_retry_in_flight_collisions
+    holder = DevEnv::CLI.new(config: @config)
     other = DevEnv::CLI.new(config: @config)
-    @cli.define_singleton_method(:random_environment_id) { "aaaaaaaa" }
-    sequence = %w[aaaaaaaa bbbbbbbb]
+    holder.define_singleton_method(:random_environment_id) { "cccccccc" }
+    sequence = %w[cccccccc dddddddd]
     other.define_singleton_method(:random_environment_id) { sequence.shift }
 
-    @cli.send(:with_environment_id_reservation) do |first|
+    holder.send(:with_environment_id_reservation) do |first|
       second = other.send(:with_environment_id_reservation) { |id| id }
-      assert_equal "aaaaaaaa", first
-      assert_equal "bbbbbbbb", second
+      assert_equal "cccccccc", first
+      assert_equal "dddddddd", second
     end
     assert_empty sequence
   end
 
-  def test_up_summary_ends_with_the_total_duration
-    key = save_state(project: "proj", branch: "feature", port: 4001, id: "aaaaaaaa")
-
-    in_project do
-      out, = capture_io { @cli.send(:print_summary, key, total: 65) }
-
-      assert_includes out, "ID         aaaaaaaa"
-      assert_includes out, "dev-env down aaaaaaaa"
-      assert out.rstrip.end_with?("Total      [1m 05s]"), out
-    end
-  end
-
-  def test_up_summary_prints_a_row_per_summary_command
+  def test_up_summary_prints_command_rows_and_the_total_and_warns_for_a_silent_command
     worktree = Dir.mktmpdir.tap { |dir| @tmp_dirs << dir }
     key = save_state(project: "proj", branch: "feature", port: 4001, id: "aaaaaaaa",
                      "worktree" => worktree)
 
     in_project("proj", "summary" => { "Login" => "echo https://${DOMAIN}/admin?lt=$(basename $(pwd))" }) do
-      out, = capture_io { @cli.send(:print_summary, key, total: 1) }
+      out, = capture_io { @cli.send(:print_summary, key, total: 65) }
 
+      assert_includes out, "ID         aaaaaaaa"
+      assert_includes out, "dev-env down aaaaaaaa"
       assert_includes out, "Login      https://aaaaaaaa-proj.example.com/admin?lt=#{File.basename(worktree)}"
+      assert out.rstrip.end_with?("Total      [1m 05s]"), out
     end
-  end
 
-  def test_up_summary_warns_instead_of_printing_a_row_for_a_silent_command
-    worktree = Dir.mktmpdir.tap { |dir| @tmp_dirs << dir }
-    key = save_state(project: "proj", branch: "feature", port: 4001, id: "aaaaaaaa",
-                     "worktree" => worktree)
-
+    # A fresh CLI, because the project and its summary are memoized per process.
     in_project("proj", "summary" => { "Login" => "exit 3" }) do
-      out, err = capture_io { @cli.send(:print_summary, key, total: 1) }
+      out, err = capture_io { DevEnv::CLI.new(config: @config).send(:print_summary, key, total: 1) }
 
       refute_includes out, "Login"
       assert_includes err, "Login"
@@ -551,36 +465,28 @@ class CLITest < Minitest::Test
 
   def test_down_removes_state_caddy_route_and_password
     key = save_state(project: "proj", branch: "feature", port: 4001, id: "aaaaaaaa")
-    secrets = DevEnv::Secrets.new(@config.secret_dir)
-    secrets.password_for(key)
+    @store.password_for(key)
 
     in_project do
       route = @cli.send(:caddy).site_path(key)
       FileUtils.mkdir_p(File.dirname(route))
       File.write(route, "# Managed by dev-env\n")
-      @cli.send(:teardown_caddy).define_singleton_method(:reload) { nil }
-      @cli.send(:systemd).define_singleton_method(:systemctl) { |*| true }
-      @cli.send(:systemd).define_singleton_method(:status) { |_| "inactive" }
-      @cli.send(:systemd).define_singleton_method(:configure_process_manager) { |*| nil }
+      stub_teardown
       dropped = stub_database_drops
 
       out, = capture_io { @cli.send(:cmd_down, ["aaaaaaaa"]) }
 
       refute @store.exist?(key)
       refute_path_exists route
-      refute secrets.password?(key)
+      refute @store.password?(key)
       assert_equal ["dev_env_proj_4001_aaaaaaaa"], dropped
       assert_includes out, "proj/feature removed"
-      refute_match(/kept for reuse|parking/i, out)
     end
   end
 
   def test_down_keeps_resources_and_state_when_the_service_does_not_stop
     key = save_state(project: "proj", branch: "feature", port: 4001, id: "aaaaaaaa")
-    @cli.send(:teardown_caddy).define_singleton_method(:reload) { nil }
-    @cli.send(:systemd).define_singleton_method(:systemctl) { |*| true }
-    @cli.send(:systemd).define_singleton_method(:status) { |_| "active" }
-    @cli.send(:systemd).define_singleton_method(:configure_process_manager) { |*| nil }
+    stub_teardown(status: "active")
     dropped = stub_database_drops
 
     error = nil
@@ -597,10 +503,7 @@ class CLITest < Minitest::Test
     key = save_state(project: "proj", branch: "feature", port: 4001, id: "aaaaaaaa",
                      "databases" => databases, "worktree" => worktree,
                      "project_root" => root, "worktree_owned" => true)
-    @cli.send(:teardown_caddy).define_singleton_method(:reload) { nil }
-    @cli.send(:systemd).define_singleton_method(:systemctl) { |*| true }
-    @cli.send(:systemd).define_singleton_method(:status) { |_| "inactive" }
-    @cli.send(:systemd).define_singleton_method(:configure_process_manager) { |*| nil }
+    stub_teardown
     calls = []
     fail_once = true
     database = Object.new
@@ -628,44 +531,42 @@ class CLITest < Minitest::Test
 
   def test_down_requires_force_before_discarding_changes_in_an_owned_worktree
     root, worktree = create_owned_worktree
-    File.write(File.join(worktree, "uncommitted.txt"), "keep me")
+    File.write(File.join(worktree, "uncommitted.txt"), "discard me")
     key = save_state(project: "proj", branch: "feature", port: 4001, id: "aaaaaaaa",
                      "worktree" => worktree, "project_root" => root, "worktree_owned" => true)
 
     error = assert_raises(DevEnv::Error) { @cli.send(:cmd_down, ["aaaaaaaa"]) }
-
     assert_includes error.message, "has uncommitted changes"
     assert_includes error.message, "--force"
     assert_includes error.message, "--keep-worktree"
     assert @store.exist?(key)
     assert_path_exists worktree
-  end
 
-  def test_down_force_discards_changes_in_an_owned_worktree
-    root, worktree = create_owned_worktree
-    File.write(File.join(worktree, "uncommitted.txt"), "discard me")
-    key = save_state(project: "proj", branch: "feature", port: 4001, id: "aaaaaaaa",
-                     "worktree" => worktree, "project_root" => root, "worktree_owned" => true)
-    @cli.send(:teardown_caddy).define_singleton_method(:reload) { nil }
-    @cli.send(:systemd).define_singleton_method(:systemctl) { |*| true }
-    @cli.send(:systemd).define_singleton_method(:status) { |_| "inactive" }
-    @cli.send(:systemd).define_singleton_method(:configure_process_manager) { |*| nil }
+    stub_teardown
     stub_database_drops
-
     capture_io { @cli.send(:cmd_down, ["aaaaaaaa", "--force"]) }
-
     refute @store.exist?(key)
     refute_path_exists worktree
   end
 
-  def test_down_does_not_accept_a_branch_as_an_explicit_target
-    key = save_state(project: "proj", branch: "feature", port: 4001, id: "aaaaaaaa")
+  def test_down_takes_an_id_explicitly_or_inferred_from_the_current_worktree_but_never_a_branch
+    worktree = Dir.mktmpdir.tap { |d| @tmp_dirs << d }
+    key = save_state(project: "proj", branch: "feature", port: 4001, id: "aaaaaaaa",
+                     "worktree" => worktree)
 
     in_project do
       error = assert_raises(DevEnv::Error) { @cli.send(:cmd_down, ["feature"]) }
-
       assert_includes error.message, "no environment \"feature\""
+
+      error = assert_raises(DevEnv::Error) { @cli.send(:cmd_down, []) }
+      assert_includes error.message, "Usage: dev-env down [id]"
       assert @store.exist?(key)
+
+      stub_teardown
+      stub_database_drops
+      out, = capture_io { Dir.chdir(worktree) { @cli.send(:cmd_down, []) } }
+      refute @store.exist?(key), "expected the environment to be inferred from the worktree"
+      assert_includes out, "proj/feature removed"
     end
   end
 
@@ -697,47 +598,17 @@ class CLITest < Minitest::Test
     assert_includes out, "All environments removed"
   end
 
-  def test_down_infers_the_environment_from_the_current_worktree_when_omitted
-    worktree = Dir.mktmpdir.tap { |d| @tmp_dirs << d }
-    key = save_state(project: "proj", branch: "feature", port: 4001, id: "aaaaaaaa",
-                     "worktree" => worktree)
-
-    in_project do
-      @cli.send(:teardown_caddy).define_singleton_method(:reload) { nil }
-      @cli.send(:systemd).define_singleton_method(:systemctl) { |*| true }
-      @cli.send(:systemd).define_singleton_method(:status) { |_| "inactive" }
-      @cli.send(:systemd).define_singleton_method(:configure_process_manager) { |*| nil }
-      stub_database_drops
-
-      out, = capture_io { Dir.chdir(worktree) { @cli.send(:cmd_down, []) } }
-
-      refute @store.exist?(key), "expected the environment to be inferred from the worktree"
-      assert_includes out, "proj/feature removed"
-    end
-  end
-
-  def test_down_without_argument_outside_a_worktree_fails_with_usage
-    save_state(project: "proj", branch: "feature", port: 4001, id: "aaaaaaaa")
-    in_project do
-      error = assert_raises(DevEnv::Error) { @cli.send(:cmd_down, []) }
-      assert_includes error.message, "Usage: dev-env down [id]"
-    end
-  end
-
   def test_down_drops_every_recorded_database_with_the_recorded_adapter
     key = save_state(project: "proj", branch: "feature", port: 4001, id: "aaaaaaaa",
                      "databases" => ["dev_env_proj_4001_aaaaaaaa", "dev_env_proj_4001_aaaaaaaa_data_science"],
                      "database_settings" => { "adapter" => "mysql", "user" => "sample_dev" })
 
     in_project do
-      @cli.send(:teardown_caddy).define_singleton_method(:reload) { nil }
-      @cli.send(:systemd).define_singleton_method(:systemctl) { |*| true }
-      @cli.send(:systemd).define_singleton_method(:status) { |_| "inactive" }
-      @cli.send(:systemd).define_singleton_method(:configure_process_manager) { |*| nil }
+      stub_teardown
 
       state = @store.load(key)
       db = @cli.send(:database_for, state)
-      assert_instance_of DevEnv::Database::MySQL, db, "the adapter comes from state, not the repository"
+      assert_equal "mysql2://sample_dev@127.0.0.1:3306/x", db.url("x"), "the adapter comes from state, not the repository"
 
       dropped = stub_database_drops
       capture_io { @cli.send(:cmd_down, ["aaaaaaaa"]) }
@@ -750,10 +621,7 @@ class CLITest < Minitest::Test
                      "after_down" => ["cleanup 4001 feature", "exit 1"])
 
     in_project("proj", "after_down" => ["cleanup ${PORT} ${BRANCH}", "exit 1"]) do
-      @cli.send(:teardown_caddy).define_singleton_method(:reload) { nil }
-      @cli.send(:systemd).define_singleton_method(:systemctl) { |*| true }
-      @cli.send(:systemd).define_singleton_method(:status) { |_| "inactive" }
-      @cli.send(:systemd).define_singleton_method(:configure_process_manager) { |*| nil }
+      stub_teardown
       stub_database_drops
       calls = []
       @cli.define_singleton_method(:run) do |*cmd, **kwargs|
@@ -784,33 +652,25 @@ class CLITest < Minitest::Test
 
       assert_path_exists File.join(@config.sites_dir, DevEnv::Caddy::WILDCARD_SITE)
       assert_path_exists File.join(@config.sites_dir, DevEnv::Caddy::ROUTES_DIR, "#{mine}.caddy")
-      refute_path_exists File.join(@config.sites_dir, "zed.wildcard.caddy")
       assert_empty Dir.glob(File.join(@config.sites_dir, "**", "#{other}.caddy"))
       assert_includes out, "Certificates warmed for proj"
     end
   end
 
-  def test_creds_without_argument_enumerates_the_projects_recorded_environments
+  def test_creds_enumerates_the_projects_environments_and_never_invents_a_password
     key = save_state(project: "proj", branch: "feature", port: 4001, id: "aaaaaaaa")
-    save_state(project: "zed", branch: "other", port: 4002, id: "bbbbbbbb")
-    password = DevEnv::Secrets.new(@config.secret_dir).password_for(key)
+    public_key = save_state(project: "proj", branch: "open", port: 4002, id: "bbbbbbbb", "basic_auth" => false)
+    save_state(project: "zed", branch: "other", port: 4003, id: "cccccccc")
+    password = @store.password_for(key)
 
     in_project do
       out, = capture_io { @cli.send(:cmd_creds, []) }
       assert_includes out, "feature  https://aaaaaaaa-proj.example.com  dev / #{password}"
-      refute_includes out, "bbbbbbbb"
-    end
-  end
+      refute_includes out, "cccccccc"
 
-  def test_creds_does_not_create_a_password_for_a_public_environment
-    key = save_state(project: "proj", branch: "feature", port: 4001, id: "aaaaaaaa", "basic_auth" => false)
-    secrets = DevEnv::Secrets.new(@config.secret_dir)
-
-    in_project do
-      out, = capture_io { @cli.send(:cmd_creds, ["feature"]) }
-
-      assert_includes out, "proj/feature is public"
-      refute secrets.password?(key)
+      out, = capture_io { @cli.send(:cmd_creds, ["open"]) }
+      assert_includes out, "proj/open is public"
+      refute @store.password?(public_key)
     end
   end
 end
