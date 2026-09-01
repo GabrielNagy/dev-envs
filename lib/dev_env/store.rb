@@ -39,8 +39,8 @@ module DevEnv
 
     def write_env(key, env) = atomic_write(env_path(key), env.map { |k, v| "#{k}=#{v}" }.join("\n") + "\n")
 
-    # The same environment the service runs with, so `exec` and `activate`
-    # see exactly what the server sees.
+    # The same environment the service runs with, so `after_down` hooks and
+    # summary commands see exactly what the server sees.
     def saved_env(key)
       raise Error, "no environment file for #{key.inspect} — bring it up first" unless File.exist?(env_path(key))
       File.readlines(env_path(key), chomp: true).reject(&:empty?).to_h { |line| line.split("=", 2) }

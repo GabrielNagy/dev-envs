@@ -6,7 +6,7 @@ module DevEnv
   class CLI
     include Util
 
-    COMMANDS = %w[setup init up down list creds logs restart exec activate seed warm].freeze
+    COMMANDS = %w[setup init up down list creds logs restart seed warm].freeze
     COMMAND_ALIASES = { "ls" => "list" }.freeze
     MACHINE_LIFECYCLE_COMMANDS = %w[setup warm].freeze
 
@@ -25,9 +25,6 @@ module DevEnv
         logs [target] [-f]
                           Show or follow service logs
         restart [target]  Restart the service
-        exec [target] -c "command"
-                          Run a command in the environment's worktree and env
-        activate [target] Open a shell in the environment's worktree and env; exit to leave
         seed [target]     Rebuild the database from the seed template or dump
         warm              Rewrite recorded Caddy sites and pre-issue certificates
 
@@ -366,39 +363,6 @@ module DevEnv
         systemd.systemctl("restart", systemd.unit(key))
         ok(wait_for_boot(state["port"]) ? "Restarted #{key}" : "Restarted #{key}, not answering yet")
       end
-    end
-
-    def cmd_exec(argv)
-      command = nil
-      parser = parse_options!(argv, "Usage: dev-env exec [target] -c \"command\"") do |o|
-        o.on("-c COMMAND", "Command to run in the environment") { |v| command = v }
-      end
-      raise Error, parser.banner if command.to_s.empty?
-      key = resolve_target(argv, parser.banner)
-      worktree = store.load(key)["worktree"]
-      system(store.saved_env(key), command, chdir: worktree)
-      exit($?.exitstatus || 1)
-    end
-
-    # Spawns an interactive shell in the environment's worktree with its env
-    # applied — the pipenv/poetry/nix `shell` pattern. Leaving is just `exit`.
-    # PATH is left alone: the saved one exists only because systemd starts
-    # units with a minimal PATH, and an interactive shell already has a
-    # better one.
-    def cmd_activate(argv)
-      parser = parse_options!(argv, "Usage: dev-env activate [target]")
-      key = resolve_target(argv, parser.banner)
-      state = store.load(key)
-      if nested_in_active_shell?
-        # A child process cannot make its parent shell exit, so a shell
-        # started here could only nest inside the active one. Refuse instead.
-        raise Error, "already inside #{ENV['DEV_ENV_ACTIVE']} — `exit` first, or switch shells " \
-                     "in place with `exec dev-env activate #{state['id']}`"
-      end
-      env = store.saved_env(key).except("PATH").merge("DEV_ENV_ACTIVE" => state["id"])
-      ok "Entering #{state['id']} (#{state['worktree']}) — exit to leave"
-      $stdout.flush # exec replaces the process before Ruby flushes buffered output
-      exec(env, ENV.fetch("SHELL", "/bin/sh"), chdir: state["worktree"])
     end
 
     def cmd_seed(argv)
@@ -936,20 +900,15 @@ module DevEnv
     end
 
     # The environment whose worktree contains the current directory, so a
-    # command run from inside a served checkout can leave the branch off. A
-    # shell entered with `dev-env activate` counts too, even after cd'ing
-    # elsewhere.
+    # command run from inside a served checkout can leave the branch off.
     def implicit_key
       here = File.realpath(Dir.pwd)
-      match = store.states.filter_map do |state|
+      store.states.filter_map do |state|
         worktree = state["worktree"].to_s
         next if worktree.empty? || !Dir.exist?(worktree)
         root = File.realpath(worktree)
         [state["key"], root] if here == root || here.start_with?(root + File::SEPARATOR)
-      end.max_by { |_, root| root.length }
-      return match.first if match
-      active = ENV["DEV_ENV_ACTIVE"].to_s
-      environment_key_for(active) unless active.empty?
+      end.max_by { |_, root| root.length }&.first
     end
 
     # The explicit target when given, otherwise the environment inferred from
@@ -959,18 +918,6 @@ module DevEnv
       return resolve(target) if target
 
       implicit_key || raise(Error, "#{usage}\n  no target given, and #{Dir.pwd} is not inside an environment's worktree")
-    end
-
-    # True when this command was run inside an activated shell, as opposed to
-    # exec'd in place of one. `exec` preserves the environment, so
-    # DEV_ENV_ACTIVE alone cannot tell the two apart — but the parent process
-    # can: run inside the activated shell, that shell is the parent; exec'd,
-    # its parent is ours.
-    def nested_in_active_shell?
-      return false unless ENV["DEV_ENV_ACTIVE"]
-      File.read("/proc/#{Process.ppid}/environ").split("\0").any? { |v| v.start_with?("DEV_ENV_ACTIVE=") }
-    rescue SystemCallError, IOError
-      true # cannot prove we were exec'd; refusing beats silently nesting
     end
   end
 end

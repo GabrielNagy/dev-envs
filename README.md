@@ -13,8 +13,6 @@ dev-env up <branch>     # create an environment
 dev-env list            # what is recorded, and where it answers (alias: ls)
 dev-env creds [target]  # basic-auth credentials
 dev-env logs [target] -f  # follow the log
-dev-env exec [target] -c "bin/rails db:migrate:status"  # run one command in its context
-dev-env activate [target]  # open a shell in its worktree + env; exit to leave
 dev-env down <id>       # tear one environment down by its immutable ID
 dev-env down --all      # tear every active or inactive environment down
 ```
