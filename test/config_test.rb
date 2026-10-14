@@ -7,8 +7,11 @@ class ConfigTest < Minitest::Test
 
   def test_defaults_settings_and_required_keys
     original = ENV.delete("DEV_ENV_HOME")
+    original_worktrees = ENV.delete("DEV_ENV_WORKTREES_DIR")
     assert_equal File.expand_path("~/.config/dev-envs"), DevEnv::Config.new.home
+    assert_equal File.expand_path("~/.dev-envs/worktrees"), DevEnv::Config.new.worktrees_dir
     ENV["DEV_ENV_HOME"] = original if original
+    ENV["DEV_ENV_WORKTREES_DIR"] = original_worktrees if original_worktrees
 
     missing = DevEnv::Config.new(home: Dir.mktmpdir.tap { |d| (@tmp_dirs ||= []) << d })
     assert_raises(DevEnv::Error) { missing.base_domain }

@@ -15,7 +15,7 @@ class ProjectTest < Minitest::Test
     assert_equal "my-app--dev-env-support--pkliinp6", project.key_for("dev-env-support", "pkliinp6")
     assert_equal "pkliinp6-my-app.example.com", project.domain_for("pkliinp6")
     assert_equal "dev_env_my_app_4593_pkliinp6", project.database_for(4593, "pkliinp6")
-    assert_equal "/repos/My App-worktrees", project.worktree_root
+    assert_equal File.join(@config.worktrees_dir, "my-app"), project.worktree_root
 
     # Branch slugs may collide; the environment ID keeps the keys distinct.
     collides = build_project(@config, { "name" => "proj" })

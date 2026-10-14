@@ -19,7 +19,7 @@ module DevEnvTest
     }.merge(extra)
     File.write(File.join(home, "config.json"), JSON.generate(settings))
     DevEnv::Config.new(home: home, sites_dir: sites, caddyfile: File.join(sites, "Caddyfile"),
-                       cache_dir: File.join(home, "cache"))
+                       cache_dir: File.join(home, "cache"), worktrees_dir: File.join(home, "worktrees"))
   end
 
   def build_project(config, settings = {}, root: "/repo")

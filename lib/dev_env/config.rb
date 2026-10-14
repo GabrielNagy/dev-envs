@@ -2,17 +2,19 @@
 
 module DevEnv
   class Config
-    attr_reader :home, :sites_dir, :caddyfile, :cache_dir
+    attr_reader :home, :sites_dir, :caddyfile, :cache_dir, :worktrees_dir
 
     def initialize(home: ENV.fetch("DEV_ENV_HOME", File.expand_path("~/.config/dev-envs")),
                    sites_dir: ENV.fetch("DEV_ENV_SITES_DIR", "/etc/caddy/sites"),
                    caddyfile: ENV.fetch("DEV_ENV_CADDYFILE", "/etc/caddy/Caddyfile"),
                    cache_dir: ENV.fetch("DEV_ENV_CACHE_DIR",
-                                        File.join(ENV.fetch("XDG_CACHE_HOME", File.expand_path("~/.cache")), "dev-envs")))
+                                        File.join(ENV.fetch("XDG_CACHE_HOME", File.expand_path("~/.cache")), "dev-envs")),
+                   worktrees_dir: ENV.fetch("DEV_ENV_WORKTREES_DIR", File.expand_path("~/.dev-envs/worktrees")))
       @home = home
       @sites_dir = sites_dir
       @caddyfile = caddyfile
       @cache_dir = cache_dir
+      @worktrees_dir = worktrees_dir
     end
 
     def path       = File.join(home, "config.json")

@@ -76,7 +76,7 @@ module DevEnv
       value
     end
 
-    def worktree_root = File.join(File.dirname(root), "#{File.basename(root)}-worktrees")
+    def worktree_root = File.join(@config.worktrees_dir, name)
 
     def key_for(branch, id) = "#{name}--#{slugify(branch)}--#{id}"
 
