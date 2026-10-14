@@ -399,27 +399,46 @@ class CLITest < Minitest::Test
     assert_empty sequence
   end
 
-  def test_up_summary_prints_command_rows_and_the_total_and_warns_for_a_silent_command
-    worktree = Dir.mktmpdir.tap { |dir| @tmp_dirs << dir }
-    key = save_state(project: "proj", branch: "feature", port: 4001, id: "aaaaaaaa",
-                     "worktree" => worktree)
+  def test_up_summary_points_at_the_login_command_and_prints_the_total
+    key = save_state(project: "proj", branch: "feature", port: 4001, id: "aaaaaaaa", "login_command" => "true")
 
-    in_project("proj", "summary" => { "Login" => "echo https://${DOMAIN}/admin?lt=$(basename $(pwd))" }) do
+    in_project do
       out, = capture_io { @cli.send(:print_summary, key, total: 65) }
 
       assert_includes out, "ID         aaaaaaaa"
+      assert_includes out, "Login      dev-env login aaaaaaaa"
       assert_includes out, "dev-env down aaaaaaaa"
-      assert_includes out, "Login      https://aaaaaaaa-proj.example.com/admin?lt=#{File.basename(worktree)}"
       assert out.rstrip.end_with?("Total      [1m 05s]"), out
     end
 
-    # A fresh CLI, because the project and its summary are memoized per process.
-    in_project("proj", "summary" => { "Login" => "exit 3" }) do
-      out, err = capture_io { DevEnv::CLI.new(config: @config).send(:print_summary, key, total: 1) }
-
+    save_state(project: "proj", branch: "feature", port: 4001, id: "aaaaaaaa")
+    in_project do
+      out, = capture_io { @cli.send(:print_summary, key, total: 1) }
       refute_includes out, "Login"
-      assert_includes err, "Login"
-      assert out.rstrip.end_with?("Total      [1s]"), out
+    end
+  end
+
+  def test_login_prints_the_last_line_of_the_recorded_command_run_in_the_environment
+    worktree = Dir.mktmpdir.tap { |dir| @tmp_dirs << dir }
+    save = lambda do |command|
+      save_state(project: "proj", branch: "feature", port: 4001, id: "aaaaaaaa",
+                 "worktree" => worktree, "login_command" => command)
+    end
+
+    # The worktree's own configuration lacks a login command: a branch can
+    # carry a stale .dev-env.json that `up` did not use.
+    in_project do
+      save.call("echo booting; echo https://example/admin?lt=$(basename $(pwd))-$PORT")
+      out, = capture_io { @cli.send(:cmd_login, ["feature"]) }
+      assert_equal "https://example/admin?lt=#{File.basename(worktree)}-4001\n", out
+
+      save.call("echo partial; exit 3")
+      error = assert_raises(DevEnv::Error) { @cli.send(:cmd_login, ["aaaaaaaa"]) }
+      assert_includes error.message, "failed or printed nothing"
+
+      save.call(nil)
+      error = assert_raises(DevEnv::Error) { @cli.send(:cmd_login, ["aaaaaaaa"]) }
+      assert_includes error.message, "has no login command"
     end
   end
 

@@ -32,18 +32,14 @@ class ProjectTest < Minitest::Test
     project = build_project(@config)
     assert_nil project.process_manager
     assert_equal [], project.after_down
-    assert_equal({}, project.summary)
     refute project.public?
 
     configured = build_project(@config, { "process_manager" => "overmind", "after_down" => ["bin/cleanup"],
-                                          "summary" => { "Login" => "bin/token" }, "public" => true })
+                                          "public" => true })
     assert_equal "overmind", configured.process_manager
     assert_equal ["bin/cleanup"], configured.after_down
-    assert_equal({ "Login" => "bin/token" }, configured.summary)
     assert configured.public?
 
-    error = assert_raises(DevEnv::Error) { build_project(@config, { "summary" => ["bin/token"] }).summary }
-    assert_includes error.message, "must be an object"
     error = assert_raises(DevEnv::Error) { build_project(@config, { "public" => "yes" }).public? }
     assert_includes error.message, "must be true or false"
   end

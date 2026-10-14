@@ -62,13 +62,6 @@ module DevEnv
                                                 spec: spec)
     end
 
-    def summary
-      value = @settings["summary"] || {}
-      raise Error, "summary in project configuration must be an object" unless value.is_a?(Hash)
-
-      value
-    end
-
     def public?
       value = @settings.fetch("public", false)
       raise Error, "public in project configuration must be true or false" unless [true, false].include?(value)

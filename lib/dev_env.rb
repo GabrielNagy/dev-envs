@@ -11,6 +11,7 @@ require "securerandom"
 require "shellwords"
 require "socket"
 require "time"
+require "timeout"
 require "tmpdir"
 
 # Run project branches on this box, each reachable over HTTPS. An environment

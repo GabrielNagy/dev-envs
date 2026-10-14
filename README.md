@@ -12,6 +12,7 @@ certificate for the machine's base domain.
 dev-env up <branch>     # create an environment
 dev-env list            # what is recorded, and where it answers (alias: ls)
 dev-env creds [target]  # basic-auth credentials
+dev-env login [target]  # the app's test login, from commands.login
 dev-env logs [target] -f  # follow the log
 dev-env down <id>       # tear one environment down by its immutable ID
 dev-env down --all      # tear every active or inactive environment down
@@ -144,12 +145,11 @@ Keys, all optional except `commands.server`:
 | `name` | Project component appended to each environment ID in its hostname; defaults to the repository directory name |
 | `public` | Set `true` to disable basic auth by default; defaults to `false` |
 | `subdomains` | Hostnames to serve, and which sit behind basic auth |
-| `commands` | `install`, `schema`, `migrate`, `server` |
+| `commands` | `install`, `schema`, `migrate`, `server`, `ready`, `login` |
 | `process_manager` | Set to `overmind` when `commands.server` delegates to Overmind |
 | `database` | Engine and connection: `adapter`, `host`, `port`, `user`, `extra` |
 | `env` | Environment variables for those commands and the service |
 | `after_down` | Commands run by `down` after the service stops, before anything is removed |
-| `summary` | Labelled commands whose output becomes a row of the `up` summary |
 | `worktree_files` | Untracked files written into each worktree |
 | `install_cache` | Seed an install directory from the last successful install with matching key files |
 | `seed_template` | Seed each environment by cloning a template database |
@@ -193,28 +193,26 @@ configuration and checked-in runtime-version file that can change the installed
 directory. Missing optional key files are included in the fingerprint, and
 globs allow workspace manifests to participate.
 
-`summary` puts a project's own line into the block `up` prints at the end,
-where it can be read rather than scrolled back to:
+`commands.login` prints a way into the application's test data, a login URL or a
+pair of test credentials, so it can be asked for rather than looked up:
 
 ```json
-"summary": {
-  "Login": "bin/rails runner 'puts %Q(https://#{ENV.fetch(%q(DOMAIN))}/admin?lt=#{User.first.auto_login_token})'"
-}
+"login": "bin/rails runner 'puts %Q(https://#{ENV.fetch(%q(DOMAIN))}/admin?lt=#{User.first.auto_login_token})'"
 ```
 
-```
-  Database   dev_env_thing_4001_pkliinp6  (port 4001)
-  Login      https://pkliinp6-thing.example.com/admin?lt=1dscvkm5xha5hbp9d8xd
+```sh
+$ dev-env login pkliinp6
+https://pkliinp6-thing.example.com/admin?lt=1dscvkm5xha5hbp9d8xd
 ```
 
-Each command runs once the environment answers, in its worktree and with the
-variables its service runs with, and the last line it prints becomes the value.
-Keep labels to ten characters, the width the fixed rows are padded to. The
-environment is already up by then, so a command that fails or prints nothing
-costs its row and a warning, not the `up`. Every command is one more thing
-between the service starting and the summary appearing: a hook that boots the
-application again is seconds the summary sits silent, and those seconds fall
-outside the reported total.
+The command runs in the environment's worktree with the variables its service
+runs with, and the last line it prints is the value, so it may log ahead of it.
+Like `commands.ready`, it is resolved and recorded on `up` from the
+configuration `up` used, so a change applies to environments brought up
+after it. The `up` summary shows how to
+call it; it does not run it, so booting the application a second time never
+delays `up`. The value also appears in ID inspection (see below). Treat it as
+test data: it is exposed without the care given to the basic-auth password.
 
 `after_down` is for resources dev-env does not track — a paired worktree in a
 second repository, say. Hooks run in the environment's worktree with its saved
@@ -372,7 +370,11 @@ Environment objects expose only `id`, `project`, `project_root`, `branch`,
 `worktree`, `worktree_owned`, and a credential-free `url`. ID-based inspection and
 JSON `up` also include `ready`. ID inspection returns `environment: null` for an
 absent ID, never an error disguised as absence. Internal keys, ports, database
-details, readiness commands, and authentication material are not part of this API.
+details, readiness commands, and basic-auth credentials are not part of this API.
+
+ID inspection also includes `login`, the value `dev-env login` prints. It is
+null unless the environment is ready and `commands.login` succeeds with output
+within 60 seconds, and it costs one run of the command on every inspection.
 
 JSON `up` requires both an active service and successful application readiness.
 By default readiness means HTTP 200 from loopback `/` with the environment's Host

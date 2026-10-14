@@ -64,9 +64,17 @@ class AutomationTest < Minitest::Test
     assert_equal true, result.dig("environment", "ready")
     assert_equal "https://a1b2c3d4-example.example.com/", result.dig("environment", "url")
     refute result["environment"].key?("readiness_command")
+    assert_nil result.dig("environment", "login")
+    state["login_command"] = "echo secret-output >&2; echo noise; echo https://a1b2c3d4-example.example.com/admin"
+    store.save(key, state)
+    result = cli("inspect", "a1b2c3d4", "--json").first
+    assert_equal "https://a1b2c3d4-example.example.com/admin", result.dig("environment", "login")
+    refute result["environment"].key?("login_command")
     state["provisioned"] = false
     store.save(key, state)
-    assert_equal false, cli("inspect", "a1b2c3d4", "--json").first.dig("environment", "ready")
+    result = cli("inspect", "a1b2c3d4", "--json").first
+    assert_equal false, result.dig("environment", "ready")
+    assert_nil result.dig("environment", "login")
     state.merge!("provisioned" => true, "readiness_command" => "exit 1")
     store.save(key, state)
     assert_equal false, cli("inspect", "a1b2c3d4", "--json").first.dig("environment", "ready")

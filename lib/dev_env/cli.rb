@@ -6,9 +6,10 @@ module DevEnv
   class CLI
     include Util
 
-    COMMANDS = %w[setup init inspect up down list creds logs restart seed warm].freeze
+    COMMANDS = %w[setup init inspect up down list creds login logs restart seed warm].freeze
     COMMAND_ALIASES = { "ls" => "list" }.freeze
     MACHINE_LIFECYCLE_COMMANDS = %w[setup warm].freeze
+    LOGIN_TIMEOUT = 60
 
     USAGE = <<~TEXT
       Usage: dev-env <command> [options]
@@ -24,6 +25,7 @@ module DevEnv
         down --all        Tear down every environment on this machine
         list (ls)         Show every environment
         creds [target]    Show the basic-auth credentials
+        login [target]    Print the app's test login from the project's commands.login
         logs [target] [-f]
                           Show or follow service logs
         restart [target]  Restart the service
@@ -188,7 +190,10 @@ module DevEnv
         key = environment_key_for(id)
         return { "environment" => nil } unless key
         state = store.load(key)
-        return { "environment" => public_environment(state).merge("ready" => wait_until_ready(state, wait)) }
+        ready = wait_until_ready(state, wait)
+        # Test data only, so unlike the basic-auth password it may leave the box.
+        login = (login_for(state) if ready)
+        return { "environment" => public_environment(state).merge("ready" => ready, "login" => login) }
       end
 
       candidate = Project.load(@config, optional: true)
@@ -451,6 +456,17 @@ module DevEnv
       end
       puts "#{color('Username', BOLD)} #{@config.basic_auth_user}"
       puts "#{color('Password', BOLD)} #{color(store.password_for(key), YELLOW)}"
+    end
+
+    def cmd_login(argv)
+      parser = parse_options!(argv, "Usage: dev-env login [target]")
+      state = store.load(resolve_target(argv, parser.banner))
+      unless state["login_command"]
+        raise Error, "#{state['project']}/#{state['branch']} has no login command. commands.login is recorded " \
+                     "on `up`, so recreate the environment after adding it"
+      end
+      puts login_for(state) ||
+           raise(Error, "commands.login failed or printed nothing for #{state['project']}/#{state['branch']}")
     end
 
     def cmd_logs(argv)
@@ -815,6 +831,7 @@ module DevEnv
       app_env = project.app_env_for(vars)
       commands = interpolate(project.commands, vars)
       state["readiness_command"] = commands["ready"]
+      state["login_command"] = commands["login"]
 
       install_dependencies(commands["install"], worktree, app_env)
 
@@ -925,29 +942,38 @@ module DevEnv
       puts "  #{color('Basic auth', BOLD)} #{auth}"
       puts "  #{color('Worktree'.ljust(10), BOLD)} #{state['worktree']}#{adopted}"
       puts "  #{color('Database'.ljust(10), BOLD)} #{databases_for(state).join(', ')}  (port #{state['port']})"
-      summary_rows(state, key).each { |label, value| puts "  #{color(label.ljust(10), BOLD)} #{color(value, CYAN)}" }
       puts
+      puts "  #{color('Login'.ljust(10), BOLD)} #{color("dev-env login #{state['id']}", CYAN)}" if state["login_command"]
       puts "  #{color('Logs'.ljust(10), BOLD)} #{color("dev-env logs #{state['branch']} -f", CYAN)}"
       puts "  #{color('Tear down'.ljust(10), BOLD)} #{color("dev-env down #{state['id']}", CYAN)}"
       puts
       puts "  #{color('Total'.ljust(10), BOLD)} #{duration_tag(total)}"
     end
 
-    # Project-defined rows for the summary: one command per label, each run in
-    # the environment's worktree with the variables its service runs with. The
-    # last line of stdout is the value, so a command may log ahead of it.
-    #
-    # `up` has already succeeded by the time these run, so a command that fails
-    # or prints nothing costs its row and a warning, never the environment.
-    def summary_rows(state, key)
-      env = store.saved_env(key)
-      interpolate(project.summary, project.vars_for(state)).filter_map do |label, command|
-        value = capture_sh(command, chdir: state["worktree"], env: env).lines.last.to_s.strip
-        next [label, value] unless value.empty?
+    # The last line of stdout is the value, so the command may log ahead of
+    # it. Nil when no command is configured, it fails, prints nothing, or
+    # outlives LOGIN_TIMEOUT: booting the application is slow, but `inspect`
+    # must still return.
+    def login_for(state)
+      return unless (command = state["login_command"])
 
-        note "summary command for #{label} printed nothing: #{command}"
+      reader, writer = IO.pipe
+      pid = Process.spawn(store.saved_env(state["key"]), command, chdir: state["worktree"],
+                          in: File::NULL, out: writer, pgroup: true)
+      writer.close
+      output = begin
+        Timeout.timeout(LOGIN_TIMEOUT) { reader.read }
+      rescue Timeout::Error
+        Process.kill("KILL", -pid)
         nil
+      ensure
+        reader.close
       end
+      status = Process.waitpid2(pid).last
+      value = output.to_s.lines.last.to_s.strip
+      value if status.success? && !value.empty?
+    rescue SystemCallError
+      nil
     end
 
     # Non-destructive commands accept either an immutable environment ID or an
