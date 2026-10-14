@@ -363,6 +363,43 @@ class CLITest < Minitest::Test
     assert_equal "parent", base
   end
 
+  def test_a_failed_up_runs_after_down_hooks_once_the_service_could_have_started
+    marker = File.join(Dir.mktmpdir.tap { |dir| @tmp_dirs << dir }, "hook-ran")
+    [false, true].each do |env_written|
+      cli = DevEnv::CLI.new(config: @config)
+      in_project("proj", "after_down" => ["echo $DEV_ENV_KEEP_WORKTREE > #{marker}"]) do
+        system("git", "add", ".dev-env.json")
+        system("git", "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "initial")
+        system("git", "checkout", "-qb", "feature")
+
+        cli.send(:systemd).define_singleton_method(:installed?) { true }
+        cli.send(:systemd).define_singleton_method(:systemctl) { |*| true }
+        cli.send(:systemd).define_singleton_method(:status) { |_| "inactive" }
+        cli.send(:systemd).define_singleton_method(:configure_process_manager) { |*| nil }
+        database = Object.new
+        database.define_singleton_method(:exists?) { |_| false }
+        database.define_singleton_method(:create) { |_| true }
+        database.define_singleton_method(:drop) { |*, **| true }
+        cli.define_singleton_method(:database_for) { |_| database }
+        store = cli.send(:store)
+        cli.define_singleton_method(:build_environment) do |state, *|
+          store.write_env(state["key"], { "PORT" => state["port"].to_s }) if env_written
+          raise DevEnv::Error, "build failed"
+        end
+
+        capture_io do
+          assert_raises(DevEnv::Error) { cli.send(:cmd_up, ["feature", "--worktree", Dir.pwd, "--no-seed"]) }
+        end
+      end
+
+      if env_written
+        assert_equal "false\n", File.read(marker)
+      else
+        refute File.exist?(marker), "the hook must not run before the service could have started"
+      end
+    end
+  end
+
   def test_up_uses_the_project_public_default_and_options_override_it
     private_state = up_state_for({})
     assert_match(/\A[a-z0-9]{8}\z/, private_state["id"])

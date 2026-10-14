@@ -802,6 +802,12 @@ module DevEnv
                 end
               end
             end
+            # The service may already have created what a hook cleans up (a
+            # paired worktree, say). It cannot have started without its
+            # environment file, so without one there is nothing to undo.
+            if stopped && File.exist?(store.env_path(key))
+              run_after_down(state, { worktree: true, database: true })
+            end
             rollback.reverse_each { |description, undo| try_cleanup(failures, description, &undo) } if stopped
             note "Service is still running; leaving its databases and worktree intact" unless stopped
             try_cleanup(failures, "remove systemd override") { systemd.configure_process_manager(key, nil) } if stopped
