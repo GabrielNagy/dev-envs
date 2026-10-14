@@ -6,7 +6,7 @@ module DevEnv
   class CLI
     include Util
 
-    COMMANDS = %w[setup init up down list creds logs restart seed warm].freeze
+    COMMANDS = %w[setup init inspect up down list creds logs restart seed warm].freeze
     COMMAND_ALIASES = { "ls" => "list" }.freeze
     MACHINE_LIFECYCLE_COMMANDS = %w[setup warm].freeze
 
@@ -17,6 +17,8 @@ module DevEnv
         setup             Detect the public address, write the Caddy config and unit
       Environments and projects:
         init              Write a starter .dev-env.json
+        inspect [id] --json
+                          Inspect checkout eligibility or environment readiness
         up [branch]       Create an environment: worktree, database and service
         down [id]         Tear down an environment by its immutable ID
         down --all        Tear down every environment on this machine
@@ -45,6 +47,7 @@ module DevEnv
     def start(argv)
       command = argv.shift
       command = COMMAND_ALIASES.fetch(command, command)
+      @json = %w[inspect up down].include?(command) && !!argv.delete("--json")
       if command == "help" && argv.any?
         raise Error, "Usage: dev-env help [command]" unless argv.one?
 
@@ -62,7 +65,21 @@ module DevEnv
           end
           send("cmd_#{command}", argv)
         end
-        if MACHINE_LIFECYCLE_COMMANDS.include?(command) && !help_requested
+        if @json
+          # Redirect actual FDs too: project commands may print credentials.
+          output, errors = STDOUT.dup, STDERR.dup
+          begin
+            STDOUT.reopen(File::NULL, "w")
+            STDERR.reopen(File::NULL, "w")
+            result = operation.call
+          ensure
+            STDOUT.reopen(output)
+            STDERR.reopen(errors)
+            output.close
+            errors.close
+          end
+          puts JSON.generate({ "version" => 1 }.merge(result))
+        elsif MACHINE_LIFECYCLE_COMMANDS.include?(command) && !help_requested
           with_machine_lifecycle_lock(&operation)
         else
           operation.call
@@ -71,7 +88,12 @@ module DevEnv
         warn "#{color("Unknown command: #{command}", RED, stream: $stderr)}\n\n#{USAGE}"
         exit 1
       end
-    rescue Error => error
+    rescue StandardError => error
+      if @json
+        puts JSON.generate({ "version" => 1, "error" => "operation-failed" })
+        exit 1
+      end
+      raise unless error.is_a?(Error)
       warn color("✗ #{error.message}", RED, stream: $stderr)
       exit 1
     end
@@ -151,18 +173,97 @@ module DevEnv
       ok "Wrote #{path} — edit it to match this project, then: dev-env up <branch>"
     end
 
+    # --------------------------------------------------------- automation API
+
+    def cmd_inspect(argv)
+      wait = 0
+      parser = parse_options!(argv, "Usage: dev-env inspect [id] --json [--wait SECONDS]") do |o|
+        o.on("--wait SECONDS", Integer) { |v| wait = v }
+      end
+      raise Error, "inspect requires --json" unless @json
+      raise Error, "wait must be between 0 and 300 seconds" unless (0..300).cover?(wait)
+      id = optional_argument!(argv, parser.banner)
+      if id
+        raise Error, "expected immutable ID" unless id.match?(/\A[a-z0-9]{8}\z/)
+        key = environment_key_for(id)
+        return { "environment" => nil } unless key
+        state = store.load(key)
+        return { "environment" => public_environment(state).merge("ready" => wait_until_ready(state, wait)) }
+      end
+
+      candidate = Project.load(@config, optional: true)
+      return { "configured" => false } unless candidate
+      @project = candidate
+      here = File.realpath(capture!("git", "rev-parse", "--show-toplevel").strip)
+      root = File.realpath(project.root)
+      matches = store.states.select { |s| s["project_root"] == root && s["branch"] == current_branch }
+      raise Error, "ambiguous environment" if matches.length > 1
+      { "configured" => true, "project" => project.name, "project_root" => root,
+        "worktree" => here, "branch" => current_branch, "linked" => here != root,
+        "environment" => matches.first && public_environment(matches.first) }
+    end
+
+    def public_environment(state)
+      state.slice("id", "project", "project_root", "branch", "worktree", "worktree_owned").merge(
+        "url" => "https://#{state.fetch('domain')}/"
+      )
+    end
+
+    def wait_until_ready(state, wait)
+      return false unless state["provisioned"]
+      deadline = monotonic_time + wait
+      loop do
+        active = bounded_probe(["systemctl", "--user", "is-active", "--quiet", systemd.unit(state["key"])])
+        return true if active && health_ready?(state)
+        remaining = deadline - monotonic_time
+        return false unless remaining.positive?
+        sleep [2, remaining].min
+      end
+    end
+
+    def health_ready?(state)
+      if (command = state["readiness_command"])
+        bounded_probe(["/bin/sh", "-c", command], env: store.saved_env(state["key"]), chdir: state["worktree"])
+      else
+        Net::HTTP.start("127.0.0.1", state["port"], nil, open_timeout: 2, read_timeout: 5) do |http|
+          http.get("/", { "Host" => state["domain"] }).code == "200"
+        end
+      end
+    rescue SystemCallError, IOError, Timeout::Error
+      false
+    end
+
+    def bounded_probe(command, env: {}, chdir: Dir.pwd)
+      # Bound both systemd queries and project probes, including their children.
+      pid = Process.spawn(env, *command, chdir: chdir, pgroup: true, out: File::NULL, err: File::NULL)
+      deadline = monotonic_time + 5
+      loop do
+        result = Process.waitpid2(pid, Process::WNOHANG)
+        return result.last.success? if result
+        break if monotonic_time >= deadline
+        sleep 0.05
+      end
+      Process.kill("KILL", -pid)
+      Process.waitpid(pid)
+      false
+    rescue SystemCallError
+      false
+    end
+
     # --------------------------------------------------------------------- up
 
     def cmd_up(argv)
       started_at = monotonic_time
-      options = {}
+      options = { wait: 60 }
       parser = parse_options!(argv, "Usage: dev-env up [branch] [options]") do |o|
         o.on("--no-seed", "Skip the seed template; build the schema from the project's commands") { options[:no_seed] = true }
         o.on("--public", "Serve without HTTP basic auth (overrides project configuration)") { options[:public] = true }
         o.on("--private", "Serve with configured basic auth (overrides project configuration)") { options[:public] = false }
         o.on("--base REF", "Base ref when the branch does not exist (default: current branch)") { |v| options[:base] = v }
         o.on("--worktree PATH", "Serve an existing checkout instead of creating one") { |v| options[:worktree_path] = v }
+        o.on("--wait SECONDS", Integer, "Readiness retry window for --json (default: 60)") { |v| options[:wait] = v }
       end
+      raise Error, "wait must be between 0 and 300 seconds" unless (0..300).cover?(options[:wait])
       checked_out_branch = current_branch
       branch = optional_argument!(argv, parser.banner) || checked_out_branch ||
                raise(Error, "#{parser.banner}\n  no branch given, and the current directory is not on a branch")
@@ -171,7 +272,11 @@ module DevEnv
 
       with_environment_lifecycle_lock(project.root, project.name, branch) do
         Caddy.new(@config).ensure_certificate_configuration!
-        bring_up_environment(branch, options, started_at)
+        state = bring_up_environment(branch, options, started_at)
+        if @json
+          raise Error, "readiness timeout" unless wait_until_ready(state, options[:wait])
+          { "environment" => public_environment(state).merge("ready" => true) }
+        end
       end
     end
 
@@ -188,11 +293,17 @@ module DevEnv
       raise Error, "--force cannot be combined with --keep-worktree" if options[:force] && !options[:worktree]
 
       if options.delete(:all)
+        raise Error, "JSON teardown requires a single immutable ID" if @json
         raise Error, "#{parser.banner}\n  an environment ID cannot be combined with --all" unless argv.empty?
         return with_machine_lifecycle_lock { teardown_all_environments(options) }
       end
 
       id = optional_argument!(argv, parser.banner)
+      if @json
+        raise Error, "JSON teardown requires an immutable ID and --keep-worktree" unless
+          id&.match?(/\A[a-z0-9]{8}\z/) && !options[:worktree] && options[:database] && !options[:force]
+        return { "id" => id, "status" => "absent" } unless environment_key_for(id)
+      end
       key = if id.nil?
               implicit_key || raise(Error, "#{parser.banner}\n  no ID given, and #{Dir.pwd} is not inside an environment's worktree")
             else
@@ -202,6 +313,7 @@ module DevEnv
       with_environment_lifecycle_lock(state["project_root"], state["project"], state["branch"]) do
         teardown_environment(key, options)
       end
+      { "id" => id, "status" => "removed" } if @json
     end
 
     def teardown_all_environments(options)
@@ -691,7 +803,8 @@ module DevEnv
         end
 
         ok "#{project.name}/#{branch} is up"
-        print_summary(key, total: monotonic_time - started_at)
+        print_summary(key, total: monotonic_time - started_at) unless @json
+        state
       end
     end
 
@@ -701,6 +814,7 @@ module DevEnv
       vars = project.vars_for(state)
       app_env = project.app_env_for(vars)
       commands = interpolate(project.commands, vars)
+      state["readiness_command"] = commands["ready"]
 
       install_dependencies(commands["install"], worktree, app_env)
 
@@ -739,7 +853,11 @@ module DevEnv
       step "Starting #{systemd.unit(key)}"
       systemd.systemctl("enable", "--now", systemd.unit(key))
 
-      note "Not answering on 127.0.0.1:#{port} yet — check: dev-env logs #{branch} -f" unless wait_for_boot(port)
+      unless @json || wait_for_boot(port)
+        note "Not answering on 127.0.0.1:#{port} yet — check: dev-env logs #{branch} -f"
+      end
+      state["provisioned"] = true
+      store.save(key, state)
     end
 
     def clone_template(template, db, database, worktree, vars)

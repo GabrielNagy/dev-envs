@@ -348,6 +348,55 @@ not by a configured environment count.
 Basic-auth passwords live exactly as long as their environment record: created
 on `up`, stable across restarts, removed on `down`.
 
+## Machine-readable lifecycle
+
+Automation should use `--json`, not parse human output (which includes credentials):
+
+```sh
+dev-env inspect --json
+dev-env up feature --worktree /absolute/linked/checkout --json
+dev-env inspect a1b2c3d4 --json --wait 60
+dev-env down a1b2c3d4 --keep-worktree --json
+```
+
+Every response has `version: 1`. Errors exit nonzero with a fixed `operation-failed`
+code, without command output or secret-bearing diagnostics. Human commands keep
+their existing output. `inspect` without an ID returns `configured: false` outside
+configured projects; otherwise it returns `project`, `project_root`, `worktree`,
+`branch`, `linked`, and `environment` (null when absent). Both machine-local
+`projects` and `.dev-env.json` are supported, with the usual checkout precedence.
+
+Environment objects expose only `id`, `project`, `project_root`, `branch`,
+`worktree`, `worktree_owned`, and a credential-free `url`. ID-based inspection and
+JSON `up` also include `ready`. ID inspection returns `environment: null` for an
+absent ID, never an error disguised as absence. Internal keys, ports, database
+details, readiness commands, and authentication material are not part of this API.
+
+JSON `up` requires both an active service and successful application readiness.
+By default readiness means HTTP 200 from loopback `/` with the environment's Host
+header. A project can instead set `commands.ready`, an interpolated shell command
+whose exit status zero signals readiness. It runs in the worktree with the saved
+application environment; its stdout/stderr are discarded. For example:
+
+```json
+"ready": "test \"$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 http://127.0.0.1:${PORT}/healthcheck)\" = 200"
+```
+
+JSON `up` retries readiness for 60 seconds by default; `--wait` accepts 0–300.
+ID inspection defaults to one attempt (`--wait 0`). Retries sleep at most two
+seconds; each systemd/command probe is bounded to five seconds, HTTP connect/read
+to two/five seconds. The final bounded probe may finish after the retry window.
+An old or incomplete boot without a successful provisioning marker is never
+reported ready. A readiness timeout fails JSON `up` but retains the environment
+for diagnosis/explicit cleanup; callers must not blindly adopt that residual state.
+
+JSON teardown requires exactly one immutable ID and `--keep-worktree`; it returns
+`{ "version": 1, "id": "a1b2c3d4", "status": "removed" }` on completion,
+or `status: "absent"` if no state remains. This is retryable after a lost response.
+`--all`, `--force`, and `--keep-database` are not supported in JSON teardown.
+An absent ID never selects another environment by branch. Callers still own
+thread/worktree lifecycle and must inspect identity before destructive operations.
+
 ## Development
 
 `bin/dev-env` is a thin entry point; the implementation lives in `lib/dev_env/`,

@@ -7,8 +7,9 @@ module DevEnv
     # "" is the bare hostname; every other key adds a named hostname.
     DEFAULT_SUBDOMAINS = { "" => { "auth" => true }, "app" => { "auth" => true } }.freeze
 
-    def self.load(config)
+    def self.load(config, optional: false)
       here = Util.capture("git", "rev-parse", "--show-toplevel")
+      return if optional && here.empty?
       raise Error, "not inside a git repository" if here.empty?
 
       # Worktrees share a common git dir with the primary checkout; derive the
@@ -20,8 +21,9 @@ module DevEnv
       # Prefer the config in the checkout being used, so a branch can change
       # it before the primary checkout has the change.
       path = [here, root].map { |dir| File.join(dir, ".dev-env.json") }.find { |p| File.exist?(p) }
-      settings = path ? JSON.parse(File.read(path)) : config.project_settings(root)
+      settings = path ? JSON.parse(File.read(path)) : (config.project_settings(root) if config.exist?)
       unless settings
+        return if optional
         raise Error, "no project configuration for #{here} — run `dev-env init` or add #{root.inspect} " \
                      "to projects in #{config.path}"
       end
