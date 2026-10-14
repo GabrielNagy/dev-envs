@@ -219,7 +219,11 @@ second repository, say. Hooks run in the environment's worktree with its saved
 variables, after the service stops and before the database, worktree and state
 are removed, so they can still inspect everything. `DEV_ENV_KEEP_WORKTREE` and
 `DEV_ENV_KEEP_DATABASE` are set to `true`/`false` reflecting `--keep-worktree`
-and `--keep-database`, so hooks can honor the same intent. A failing hook
+and `--keep-database`, so hooks can honor the same intent.
+`DEV_ENV_WORKTREE_OWNED` is `true` when dev-env created the worktree. An adopted
+worktree is never removed, so `--keep-worktree` changes nothing for it, and JSON
+teardown always passes that flag. A hook can use this variable to tell a kept
+worktree from one that was never dev-env's to remove. A failing hook
 prints a warning and `down` continues; teardown never aborts halfway.
 
 `"process_manager": "overmind"` installs Overmind's shutdown handling only for

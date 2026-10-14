@@ -691,6 +691,7 @@ class CLITest < Minitest::Test
       assert hook, "expected the interpolated hook to run, got: #{calls.map(&:first)}"
       assert_equal "true", kwargs[:env]["DEV_ENV_KEEP_WORKTREE"]
       assert_equal "false", kwargs[:env]["DEV_ENV_KEEP_DATABASE"]
+      assert_equal "false", kwargs[:env]["DEV_ENV_WORKTREE_OWNED"]
       assert_includes err.to_s + out, "after_down command failed"
       refute @store.exist?(key), "a failing hook must not abort down"
     end

@@ -671,6 +671,7 @@ module DevEnv
       env = store.saved_env(state["key"]).merge(
         "DEV_ENV_KEEP_WORKTREE" => (!options[:worktree]).to_s,
         "DEV_ENV_KEEP_DATABASE" => (!options[:database]).to_s,
+        "DEV_ENV_WORKTREE_OWNED" => (state["worktree_owned"] == true).to_s,
       )
       chdir = [state["worktree"], state["project_root"], @config.home].find { |path| Dir.exist?(path.to_s) }
       hooks.each do |command|
